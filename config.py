@@ -145,30 +145,31 @@ SALES_DATA_FILE = os.path.join(DATA_DIR, "sales_data.json")
 DEFAULT_SETTINGS = {
     "admin_ids": ADMIN_IDS_ENV,
     "log_channel": LOG_CHANNEL,
-    "backup_channel": "", # Channel to auto-store admin demo videos
+    "backup_channel": "",
+    "proof_channel_id": "",
     "demo_channel_link": DEMO_CHANNEL_LINK,
     "upi_id": UPI_ID,
     "upi_name": UPI_NAME,
     "demo_channel_id": "",
     "demo_paid_status": False,
     "demo_amount": "10",
-    "payment_proof_link": "", 
-    "payment_proof_status": True, 
-    "how_to_buy_url": "", 
-    "total_orders": 0, 
-    "start_demo_videos": [], # List of video file_ids or links for /start
-    "plan_demo_videos": {}, # Dict mapping plan_id to list of videos
-    "start_demo_desc": "", # Description for /start demo album
-    "plan_demo_descs": {}, # Dict mapping plan_id to description
+    "payment_proof_link": "",
+    "payment_proof_status": True,
+    "how_to_buy_url": "",
+    "total_orders": 0,
+    "start_demo_videos": [],
+    "plan_demo_videos": {},
+    "start_demo_desc": "",
+    "plan_demo_descs": {},
     "premium_channels": [
-        {"id": "ch1", "name": "Channel 1", "amount": "99", "channel_id": "", "duration": "30 Days"},
-        {"id": "ch2", "name": "Channel 2", "amount": "99", "channel_id": "", "duration": "30 Days"},
-        {"id": "ch3", "name": "Channel 3", "amount": "99", "channel_id": "", "duration": "30 Days"},
-        {"id": "ch4", "name": "Channel 4", "amount": "99", "channel_id": "", "duration": "30 Days"},
-        {"id": "ch5", "name": "Channel 5", "amount": "99", "channel_id": "", "duration": "30 Days"},
-        {"id": "ch6", "name": "Channel 6", "amount": "99", "channel_id": "", "duration": "30 Days"},
-        {"id": "ch7", "name": "Channel 7", "amount": "99", "channel_id": "", "duration": "30 Days"},
-        {"id": "all", "name": "All Channels", "amount": "299", "channel_ids": [], "duration": "30 Days"}
+        {"id": "ch1", "name": "Channel 1", "amount": "99", "channel_id": "", "duration": "30 Days", "description": ""},
+        {"id": "ch2", "name": "Channel 2", "amount": "99", "channel_id": "", "duration": "30 Days", "description": ""},
+        {"id": "ch3", "name": "Channel 3", "amount": "99", "channel_id": "", "duration": "30 Days", "description": ""},
+        {"id": "ch4", "name": "Channel 4", "amount": "99", "channel_id": "", "duration": "30 Days", "description": ""},
+        {"id": "ch5", "name": "Channel 5", "amount": "99", "channel_id": "", "duration": "30 Days", "description": ""},
+        {"id": "ch6", "name": "Channel 6", "amount": "99", "channel_id": "", "duration": "30 Days", "description": ""},
+        {"id": "ch7", "name": "Channel 7", "amount": "99", "channel_id": "", "duration": "30 Days", "description": ""},
+        {"id": "all", "name": "All Channels", "amount": "299", "channel_ids": [], "duration": "30 Days", "description": ""}
     ]
 }
 
@@ -245,6 +246,17 @@ settings = load_json_file(SETTINGS_FILE, DEFAULT_SETTINGS)
 # Migration: Ensure premium_channels exists in settings
 if 'premium_channels' not in settings:
     settings['premium_channels'] = DEFAULT_SETTINGS['premium_channels']
+    save_json_file(SETTINGS_FILE, settings)
+
+# Migration: Ensure every premium channel has description field
+for ch in settings.get('premium_channels', []):
+    if 'description' not in ch:
+        ch['description'] = ""
+save_json_file(SETTINGS_FILE, settings)
+
+# Migration: Ensure proof_channel_id exists
+if 'proof_channel_id' not in settings:
+    settings['proof_channel_id'] = ""
     save_json_file(SETTINGS_FILE, settings)
 
 # Update PLANS with settings
