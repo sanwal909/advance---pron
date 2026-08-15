@@ -173,6 +173,25 @@ Now please send the <b>payment screenshot</b> for verification.
         if user_id not in self.pending:
             return False
         
+        pending_data = self.pending[user_id]
+        
+        # RESTRICTION: If screenshot already uploaded and not yet verified/rejected, block new one
+        if pending_data.get('screenshot_file_id'):
+            order_num = pending_data.get('order_number', 'N/A')
+            self.bot.reply_to(
+                message,
+                f"""
+⛔ <b>ALREADY SUBMITTED!</b>
+
+Aapka payment screenshot (Order #{order_num}) pehle se hi submit ho chuka hai.
+Jab tak admin purane payment ko verify/reject nahi kar dete, aap naya screenshot upload nahi kar sakte.
+
+⏳ <i>Please wait for admin verification...</i>
+                """,
+                parse_mode="HTML"
+            )
+            return True
+        
         if not message.photo:
             self.bot.reply_to(
                 message,
@@ -180,7 +199,6 @@ Now please send the <b>payment screenshot</b> for verification.
             )
             return True
         
-        pending_data = self.pending[user_id]
         plan_type = pending_data['plan']
         plan = config.PLANS[plan_type]
         
@@ -380,9 +398,34 @@ You'll receive unique join link within few minutes.
                 'upi_id': settings.get('upi_id', 'Unknown'),
                 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 'date': datetime.now().strftime("%Y-%m-%d"),
-                'admin_id': admin_id
+                'admin_id': admin_id,
+                'screenshot_file_id': pending_data.get('screenshot_file_id', '')
             }
             sales_data.append(sale_record)
+
+            # Send proof to proof channel
+            proof_channel = settings.get('proof_channel_id', '')
+            if proof_channel and pending_data.get('screenshot_file_id'):
+                user_name = pending_data.get('first_name', 'N/A')
+                proof_caption = f"""
+✅ <b>PAYMENT PROOF VERIFIED</b>
+
+👤 <b>Name:</b> {user_name}
+🆔 <b>User ID:</b> <code>{user_id}</code>
+📅 <b>Plan:</b> {plan['name']}
+💰 <b>Amount:</b> ₹{plan['amount']}
+🧾 <b>Order #:</b> {order_num}
+⏰ <b>Date:</b> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+                """
+                try:
+                    self.bot.send_photo(
+                        proof_channel,
+                        photo=pending_data['screenshot_file_id'],
+                        caption=proof_caption,
+                        parse_mode="HTML"
+                    )
+                except Exception as e:
+                    logger.error(f"Proof channel error: {e}")
             
             # Update user data to mark as premium
             if user_id in users_data:
