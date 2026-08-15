@@ -602,6 +602,14 @@ def handle_plan_selection(call):
         send_demo_videos(chat_id, plan_demos, caption=plan_desc)
     
     # NEW: Show Plan Description instead of QR
+    custom_desc = plan.get('description', '') or ""
+    if custom_desc:
+        features_text = custom_desc
+    else:
+        features_text = """✅ High Quality Content
+✅ Direct Access After Payment
+✅ 24/7 Support Available"""
+
     desc_text = f"""
 <b>💎 {plan['name'].upper()} DESCRIPTION:</b>
 
@@ -609,9 +617,7 @@ def handle_plan_selection(call):
 ⏳ <b>Duration:</b> {plan.get('duration', 'N/A')}
 
 <b>Features:</b>
-✅ High Quality Content
-✅ Direct Access After Payment
-✅ 24/7 Support Available
+{features_text}
 
 <i>Click "💳 Buy Now" below to get the payment QR code.</i>
     """
@@ -644,7 +650,44 @@ def handle_buy_now(call):
     user_id = call.from_user.id
     chat_id = call.message.chat.id
     plan_type = call.data.split('_')[1]
-    
+
+    # RESTRICTION: If user already has pending verification, block new payment
+    if str(user_id) in pending_verifications:
+        pending_data = pending_verifications[str(user_id)]
+        order_num = pending_data.get('order_number', 'N/A')
+        screenshot_uploaded = pending_data.get('screenshot_file_id', False)
+
+        if screenshot_uploaded:
+            msg = f"""
+⛔ <b>PAYMENT PENDING!</b>
+
+Aapka Order #{order_num} pehle se hi pending hai.
+Screenshot bhi upload ho chuka hai.
+Jab tak admin purane payment ko verify/reject nahi kar dete, aap naya payment create nahi kar sakte.
+
+⏳ <i>Please wait for admin verification...</i>
+            """
+        else:
+            msg = f"""
+⛔ <b>PAYMENT PENDING!</b>
+
+Aapka Order #{order_num} pehle se hi pending hai.
+Jab tak is payment ko verify/reject nahi kar dete, aap naya payment create nahi kar sakte.
+
+<b>To aage badhne ke liye:</b>
+✅ Payment complete karke screenshot upload karein
+⏳ Ya phir admin se purane payment ko cancel karne ke liye contact karein
+            """
+
+        try:
+            bot.delete_message(chat_id, call.message.message_id)
+        except:
+            pass
+
+        bot.send_message(chat_id, msg, parse_mode="HTML")
+        bot.answer_callback_query(call.id)
+        return
+
     # Find plan
     plan = None
     if plan_type in config.PLANS:
@@ -652,7 +695,7 @@ def handle_buy_now(call):
     else:
         channels = settings.get("premium_channels", [])
         plan = next((ch for ch in channels if ch['id'] == plan_type), None)
-        
+
     if not plan:
         bot.answer_callback_query(call.id, "❌ Plan not found!", show_alert=True)
         return
@@ -941,8 +984,10 @@ def handle_settings(message):
     ch_info = ""
     for ch in settings.get('premium_channels', []):
         ch_id_display = ch.get('channel_id', ch.get('channel_ids', 'Not Set'))
-        ch_info += f"• {ch.get('id', '??')}: {ch.get('name', 'Unknown')} (₹{ch.get('amount', '0')}) - <code>{ch_id_display}</code>\n"
-    
+        ch_desc = ch.get('description', '')
+        desc_display = f"\n  📝 Desc: {ch_desc[:50]}{'...' if len(ch_desc) > 50 else ''}" if ch_desc else ""
+        ch_info += f"• {ch.get('id', '??')}: {ch.get('name', 'Unknown')} (₹{ch.get('amount', '0')}) - <code>{ch_id_display}</code>{desc_display}\n"
+
     text = f"""
 <b>⚙️ CURRENT SETTINGS</b>
 
@@ -952,11 +997,12 @@ def handle_settings(message):
 <b>💰 Demo Price:</b> ₹{settings.get('demo_amount', '10')}
 <b>🔄 Demo Status:</b> {'PAID' if settings.get('demo_paid_status', False) else 'FREE'}
 
-<b> Log Channel:</b> {settings.get('log_channel', 'Not Set')}
+<b>📋 Log Channel:</b> {settings.get('log_channel', 'Not Set')}
+<b>🧾 Proof Channel ID:</b> <code>{settings.get('proof_channel_id', 'Not Set')}</code>
+<b>🧾 Proof Channel Link:</b> {settings.get('payment_proof_link', 'Not Set')}
+<b>🧾 Proof Status:</b> {'ON' if settings.get('payment_proof_status', False) else 'OFF'}
 <b>🛡️ Force Join:</b> {'ON' if settings.get('force_join_status', True) else 'OFF'}
 <b>🤖 Auto-Accept:</b> {'ON' if settings.get('auto_accept_requests', False) else 'OFF'}
-<b>🧾 Proof Channel:</b> {settings.get('payment_proof_link', 'Not Set')}
-<b>🧾 Proof Status:</b> {'ON' if settings.get('payment_proof_status', False) else 'OFF'}
 
 <b>💰 UPI Settings:</b>
 • UPI ID: <code>{settings.get('upi_id', 'Not Set')}</code>
@@ -1032,7 +1078,7 @@ def handle_broadcast(message):
 
 <code>Reply to any message with /broadcast</code>
 
-<b>Supported:</b> Text, Photos, Videos, Documents, GIFs
+<b>Supported:</b> Text, Photos, Videos, Documents, GIFs, Audio, Voice
 
 <b>How to use:</b>
 1. Send the message you want to broadcast
@@ -1068,30 +1114,44 @@ def handle_broadcast(message):
                 # Send based on type
                 if replied_msg.photo:
                     bot.send_photo(
-                        user_id, 
-                        photo=replied_msg.photo[-1].file_id, 
-                        caption=replied_msg.caption or "", 
+                        user_id,
+                        photo=replied_msg.photo[-1].file_id,
+                        caption=replied_msg.caption or "",
                         parse_mode="HTML"
                     )
                 elif replied_msg.video:
                     bot.send_video(
-                        user_id, 
-                        video=replied_msg.video.file_id, 
-                        caption=replied_msg.caption or "", 
+                        user_id,
+                        video=replied_msg.video.file_id,
+                        caption=replied_msg.caption or "",
                         parse_mode="HTML"
                     )
                 elif replied_msg.document:
                     bot.send_document(
-                        user_id, 
-                        document=replied_msg.document.file_id, 
-                        caption=replied_msg.caption or "", 
+                        user_id,
+                        document=replied_msg.document.file_id,
+                        caption=replied_msg.caption or "",
                         parse_mode="HTML"
                     )
                 elif replied_msg.animation:
                     bot.send_animation(
-                        user_id, 
-                        animation=replied_msg.animation.file_id, 
-                        caption=replied_msg.caption or "", 
+                        user_id,
+                        animation=replied_msg.animation.file_id,
+                        caption=replied_msg.caption or "",
+                        parse_mode="HTML"
+                    )
+                elif replied_msg.audio:
+                    bot.send_audio(
+                        user_id,
+                        audio=replied_msg.audio.file_id,
+                        caption=replied_msg.caption or "",
+                        parse_mode="HTML"
+                    )
+                elif replied_msg.voice:
+                    bot.send_voice(
+                        user_id,
+                        voice=replied_msg.voice.file_id,
+                        caption=replied_msg.caption or "",
                         parse_mode="HTML"
                     )
                 elif replied_msg.text:
@@ -1664,7 +1724,8 @@ def handle_add_premium_ch(message):
             "name": name,
             "amount": price,
             "channel_id": telegram_id,
-            "duration": "30 Days"
+            "duration": "30 Days",
+            "description": ""
         })
         save_settings()
         bot.reply_to(message, f"✅ Added <b>{name}</b> (₹{price}) to membership list.", parse_mode="HTML")
@@ -1712,7 +1773,7 @@ def handle_edit_premium_ch(message):
         # Everything after key is the new value
         value = " ".join(args[3:])
         
-        allowed_keys = ['name', 'amount', 'channel_id', 'duration']
+        allowed_keys = ['name', 'amount', 'channel_id', 'duration', 'description']
         if key not in allowed_keys:
             bot.reply_to(message, f"❌ Invalid key! Use: {', '.join(allowed_keys)}")
             return
@@ -2201,6 +2262,71 @@ def handle_pending(message):
     else:
         bot.reply_to(message, text, parse_mode="HTML")
 
+# ========== /CLEAR_ALL_PAYMENTS COMMAND ==========
+@bot.message_handler(commands=['clear_all_payments'])
+def handle_clear_all_payments(message):
+    """Clear ALL payments - pending verifications AND sales records"""
+    if not is_admin(message.from_user.id):
+        return
+
+    pending_count_before = len(pending_verifications)
+    sales_count_before = len(sales_data)
+
+    pending_order_nums = []
+    for uid, data in pending_verifications.items():
+        onum = data.get('order_number', 'N/A')
+        pending_order_nums.append(f"#{onum}")
+
+    sales_order_nums = []
+    for sale in sales_data:
+        onum = sale.get('order_number', 'N/A')
+        sales_order_nums.append(f"#{onum}")
+
+    # Clear all data
+    pending_verifications.clear()
+    sales_data.clear()
+    save_all_data()
+
+    pending_str = ", ".join(pending_order_nums) if pending_order_nums else "None"
+    sales_str = ", ".join(sales_order_nums) if sales_order_nums else "None"
+
+    if len(pending_str) > 3000:
+        pending_str = pending_str[:3000] + " ..."
+    if len(sales_str) > 3000:
+        sales_str = sales_str[:3000] + " ..."
+
+    result_text = f"""
+🧹 <b>ALL PAYMENTS CLEARED!</b>
+
+⏳ <b>Pending Verifications:</b> {pending_count_before} removed
+🧾 <b>Orders:</b> {pending_str}
+
+💰 <b>Sales Records:</b> {sales_count_before} removed
+🧾 <b>Orders:</b> {sales_str}
+
+✅ All payment data has been completely cleared.
+    """
+
+    bot.reply_to(message, result_text, parse_mode="HTML")
+
+# ========== /SET_PROOF_CHANNEL COMMAND ==========
+@bot.message_handler(commands=['set_proof_channel'])
+def handle_set_proof_channel(message):
+    """Set proof channel ID where verified proofs will be sent"""
+    if not is_admin(message.from_user.id):
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "Usage: <code>/set_proof_channel channel_id</code>\nExample: <code>/set_proof_channel -1001234567890</code>", parse_mode="HTML")
+        return
+
+    ch_id = args[1]
+    settings['proof_channel_id'] = ch_id
+    save_settings()
+
+    bot.reply_to(message, f"✅ Proof Channel ID set to: <code>{ch_id}</code>\n\nJab bhi koi payment verify hoga, uska proof is channel mein automatically send ho jayega with:\n• Name, User ID, Username\n• Plan, Amount, Order Number\n• Date & Payment Screenshot", parse_mode="HTML")
+
 # ========== /HELP COMMAND (FIXED HTML) ==========
 @bot.message_handler(commands=['help'])
 def handle_help(message):
@@ -2227,12 +2353,13 @@ For premium: Click "Get Premium" button
 <b>📋 VERIFICATION:</b>
 /pending - Show pending verifications
 /verify [user_id] - Manual verify
+/clear_all_payments - Clear ALL payments (pending + sales records) with order numbers
 
 <b>⚙️ SETTINGS:</b>
 /settings - View all settings
 /set [key] [value] - Change setting
 
-<b>� PRICE MANAGEMENT:</b>
+<b>💰 PRICE MANAGEMENT:</b>
 /set_price single [amount] - Set single channel price (e.g. /set_price single 99)
 /set_price all [amount] - Set all channels price (e.g. /set_price all 299)
 /demo_price [amount] - Set demo price
@@ -2240,13 +2367,14 @@ For premium: Click "Get Premium" button
 /set_demo_link [url] - Set demo link
 /demo_toggle - Toggle demo between FREE and PAID
 /set_proof_link [url] - Set payment proof channel link
+/set_proof_channel [id] - Set proof channel ID (auto-sends verified proofs here)
 /proof_toggle - Toggle payment proof button ON/OFF
 /set_backup_ch [id] - Set backup channel for videos
 
 <b>📺 CHANNEL MANAGEMENT:</b>
 /add_premium_ch id Full Name price channel_id - Add new channel
 /remove_premium_ch id - Remove channel
-/edit_premium_ch id key New Value - Edit channel (name, amount, channel_id, duration)
+/edit_premium_ch id key New Value - Edit channel (name, amount, channel_id, duration, description)
 /set_start_demos [v1] [v2]... - Set start demos
 /clear_start_demos - Clear start demos
 /set_plan_demos [plan] [v1]... - Set plan demos
@@ -2255,7 +2383,7 @@ For premium: Click "Get Premium" button
 /clear_demo_desc [id] - Clear album caption
 
 <b>📢 BROADCAST:</b>
-/broadcast (reply) - Broadcast message
+/broadcast (reply) - Broadcast message (supports: Text, Photo, Video, Doc, GIF, Audio, Voice)
 
 <b>📊 DATA:</b>
 /stats - Bot statistics
