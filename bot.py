@@ -3,6 +3,7 @@ import telebot
 from telebot import types
 import qrcode
 import time
+import random
 import threading
 from datetime import datetime, timedelta
 import logging
@@ -14,7 +15,7 @@ import sys
 # Import config and verification
 import config
 from config import *
-from verif import init_verification
+from verif import init_verification, get_random_button_color
 
 # Initialize bot
 # Use config.BOT_TOKEN to avoid NameError if star import hasn't processed it yet
@@ -29,6 +30,22 @@ bot = telebot.TeleBot(_token, parse_mode="HTML")
 
 # Initialize verification system
 verif = init_verification(bot)
+
+BUTTON_COLORS_BOT = [None, "primary", "positive", "negative"]
+
+def rnd_color():
+    """Shortcut for random button color"""
+    return random.choice(BUTTON_COLORS_BOT)
+
+def make_button(text, **kwargs):
+    """Create InlineKeyboardButton with random color if no url"""
+    btn = types.InlineKeyboardButton(text, **kwargs)
+    if 'url' not in kwargs:
+        try:
+            btn.button_color = rnd_color()
+        except:
+            pass
+    return btn
 
 def is_admin(user_id):
     """Check if a user is an admin"""
@@ -81,11 +98,17 @@ def notify_mongo_status():
 # Run notification in a separate thread to not block startup
 threading.Thread(target=notify_mongo_status, daemon=True).start()
 
-# Track demo messages for instant deletion
 user_demo_messages = {}
+user_all_messages = {}
+
+def track_msg(chat_id, message_id):
+    """Track any bot message sent to user for later bulk deletion"""
+    chat_id_str = str(chat_id)
+    if chat_id_str not in user_all_messages:
+        user_all_messages[chat_id_str] = []
+    user_all_messages[chat_id_str].append(message_id)
 
 def clear_user_demos(chat_id):
-    """Delete all tracked demo messages for a user immediately"""
     chat_id_str = str(chat_id)
     if chat_id_str in user_demo_messages:
         for msg_id in user_demo_messages[chat_id_str]:
@@ -95,18 +118,30 @@ def clear_user_demos(chat_id):
                 pass
         user_demo_messages[chat_id_str] = []
 
+def clear_all_user_msgs(chat_id):
+    """Delete ALL tracked bot messages for a user (demos + descriptions + menu msgs)"""
+    clear_user_demos(chat_id)
+    chat_id_str = str(chat_id)
+    if chat_id_str in user_all_messages:
+        for msg_id in list(user_all_messages[chat_id_str]):
+            try:
+                bot.delete_message(chat_id, msg_id)
+            except:
+                pass
+        user_all_messages[chat_id_str] = []
+
 def delete_message_after_delay(chat_id, message_id, delay=300, send_timeout_msg=False):
-    """Delete a message after a specified delay and optionally send a timeout message"""
     def delete():
         try:
             bot.delete_message(chat_id, message_id)
             logging.info(f"Successfully deleted message {message_id} in {chat_id}")
             if send_timeout_msg:
-                bot.send_message(
-                    chat_id, 
+                tm = bot.send_message(
+                    chat_id,
                     "<b>⏰ Session Timed Out!</b>\n\nThe payment QR code has been deleted for security. Please use /start to generate a new one.",
                     parse_mode="HTML"
                 )
+                track_msg(chat_id, tm.message_id)
         except Exception as e:
             logging.warning(f"Failed to delete message {message_id} in {chat_id}: {e}")
             
@@ -450,25 +485,23 @@ def log_important_event(event_type, user_data=None, plan=None):
 def handle_start(message):
     try:
         user_id = message.from_user.id
-        
-        # Force Join check removed
-            
+        chat_id = message.chat.id
+
         spam_result = check_spam(user_id)
         if spam_result:
-            bot.send_message(message.chat.id, spam_result, parse_mode="HTML")
+            m = bot.send_message(chat_id, spam_result, parse_mode="HTML")
+            track_msg(chat_id, m.message_id)
             return
 
-        # NEW: Clear old demo messages immediately
-        clear_user_demos(message.chat.id)
+        clear_all_user_msgs(chat_id)
 
-        # NEW: Send Start Demo Videos (Deleted after 10 min)
         start_demos = settings.get('start_demo_videos', [])
         if start_demos:
             start_desc = settings.get('start_demo_desc', "")
-            send_demo_videos(message.chat.id, start_demos, caption=start_desc)
-            
+            send_demo_videos(chat_id, start_demos, caption=start_desc)
+
         is_new_user = str(user_id) not in users_data
-        
+
         if is_new_user:
             users_data[str(user_id)] = {
                 'id': user_id,
@@ -479,45 +512,47 @@ def handle_start(message):
                 'is_premium': False
             }
             log_important_event("new_user", users_data[str(user_id)])
-        
+
         reset_spam_counter(user_id)
-        
-        # Check if custom start message exists
+
         if start_message_data and 'has_media' in start_message_data:
             text = start_message_data.get('text', "")
-            
+
             if start_message_data['has_media']:
                 media_type = start_message_data.get('media_type', '')
                 file_id = start_message_data.get('file_id', '')
-                
+
                 if media_type == 'photo' and file_id:
-                    bot.send_photo(
-                        message.chat.id,
+                    m = bot.send_photo(
+                        chat_id,
                         photo=file_id,
                         caption=text,
                         reply_markup=verif.main_menu_keyboard(),
                         parse_mode="HTML"
                     )
+                    track_msg(chat_id, m.message_id)
                 elif media_type == 'video' and file_id:
-                    bot.send_video(
-                        message.chat.id,
+                    m = bot.send_video(
+                        chat_id,
                         video=file_id,
                         caption=text,
                         reply_markup=verif.main_menu_keyboard(),
                         parse_mode="HTML"
                     )
+                    track_msg(chat_id, m.message_id)
                 else:
                     send_default_start(message)
             else:
-                bot.send_message(
-                    message.chat.id,
+                m = bot.send_message(
+                    chat_id,
                     text,
                     reply_markup=verif.main_menu_keyboard(),
                     parse_mode="HTML"
                 )
+                track_msg(chat_id, m.message_id)
         else:
             send_default_start(message)
-        
+
     except Exception as e:
         logging.error(f"Start error: {e}")
 
@@ -529,13 +564,14 @@ Welcome to the Premium Bot! Access high-quality exclusive content.
 
 👇 <b>Select an option:</b>
     """
-    
-    bot.send_message(
+
+    m = bot.send_message(
         message.chat.id,
         welcome_text,
         reply_markup=verif.main_menu_keyboard(),
         parse_mode="HTML"
     )
+    track_msg(message.chat.id, m.message_id)
 
 # ========== CHECK JOINED CALLBACK REMOVED ==========
 
@@ -543,23 +579,35 @@ Welcome to the Premium Bot! Access high-quality exclusive content.
 
 @bot.callback_query_handler(func=lambda call: call.data == "main_menu")
 def handle_main_menu_callback(call):
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
+
+    clear_all_user_msgs(chat_id)
+
     try:
-        welcome_text = f"""
+        bot.delete_message(chat_id, msg_id)
+    except:
+        pass
+
+    start_demos = settings.get('start_demo_videos', [])
+    if start_demos:
+        start_desc = settings.get('start_demo_desc', "")
+        send_demo_videos(chat_id, start_demos, caption=start_desc)
+
+    welcome_text = f"""
 🔥 <b>PREMIUM CONTENT</b> 🔥
 
 Welcome to the Premium Bot! Access high-quality exclusive content.
 
 👇 <b>Select an option:</b>
-        """
-        bot.edit_message_text(
-            welcome_text,
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=verif.main_menu_keyboard(),
-            parse_mode="HTML"
-        )
-    except:
-        handle_start(call.message)
+    """
+    m = bot.send_message(
+        chat_id,
+        welcome_text,
+        reply_markup=verif.main_menu_keyboard(),
+        parse_mode="HTML"
+    )
+    track_msg(chat_id, m.message_id)
     bot.answer_callback_query(call.id)
 
 # ========== PLAN SELECTION ==========
@@ -567,41 +615,44 @@ Welcome to the Premium Bot! Access high-quality exclusive content.
 def handle_plan_selection(call):
     user_id = call.from_user.id
     chat_id = call.message.chat.id
-    
-    # Check membership removed
-        
+    msg_id = call.message.message_id
+
     spam_result = check_spam(user_id)
     if spam_result:
-        bot.send_message(chat_id, spam_result, parse_mode="HTML")
+        m = bot.send_message(chat_id, spam_result, parse_mode="HTML")
+        track_msg(chat_id, m.message_id)
         bot.answer_callback_query(call.id)
         return
-    
+
     reset_spam_counter(user_id)
-    
-    # NEW: Clear old demo messages immediately
+
     clear_user_demos(chat_id)
 
-    plan_type = call.data.split('_')[1]  # monthly or lifetime
-    
-    # NEW: Find plan in premium_channels list or config.PLANS
+    try:
+        bot.delete_message(chat_id, msg_id)
+    except:
+        pass
+    if msg_id in user_all_messages.get(str(chat_id), []):
+        user_all_messages[str(chat_id)].remove(msg_id)
+
+    plan_type = call.data.split('_')[1]
+
     plan = None
     if plan_type in config.PLANS:
         plan = config.PLANS[plan_type]
     else:
         channels = settings.get("premium_channels", [])
         plan = next((ch for ch in channels if ch['id'] == plan_type), None)
-        
+
     if not plan:
         bot.answer_callback_query(call.id, "❌ Plan not found!", show_alert=True)
         return
 
-    # NEW: Send Plan Demo Videos (Multi-group support)
     plan_demos = settings.get('plan_demo_videos', {}).get(plan_type, [])
     if plan_demos:
         plan_desc = settings.get('plan_demo_descs', {}).get(plan_type, "")
         send_demo_videos(chat_id, plan_demos, caption=plan_desc)
-    
-    # NEW: Show Plan Description instead of QR
+
     custom_desc = plan.get('description', '') or ""
     if custom_desc:
         features_text = custom_desc
@@ -621,37 +672,29 @@ def handle_plan_selection(call):
 
 <i>Click "💳 Buy Now" below to get the payment QR code.</i>
     """
-    
+
     keyboard = types.InlineKeyboardMarkup(row_width=2)
-    btn_buy = types.InlineKeyboardButton("💳 Buy Now", callback_data=f"buy_{plan_type}")
-    btn_back = types.InlineKeyboardButton("🔙 Back", callback_data="back_to_main")
+    btn_buy = make_button("💳 Buy Now", callback_data=f"buy_{plan_type}")
+    btn_back = make_button("🔙 Back", callback_data="back_to_main")
     keyboard.add(btn_buy, btn_back)
-    
-    try:
-        bot.edit_message_text(
-            desc_text,
-            chat_id=chat_id,
-            message_id=call.message.message_id,
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
-    except:
-        bot.send_message(
-            chat_id,
-            desc_text,
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
-    
+
+    m = bot.send_message(
+        chat_id,
+        desc_text,
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+    track_msg(chat_id, m.message_id)
+
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('buy_'))
 def handle_buy_now(call):
     user_id = call.from_user.id
     chat_id = call.message.chat.id
+    msg_id = call.message.message_id
     plan_type = call.data.split('_')[1]
 
-    # RESTRICTION: If user already has pending verification, block new payment
     if str(user_id) in pending_verifications:
         pending_data = pending_verifications[str(user_id)]
         order_num = pending_data.get('order_number', 'N/A')
@@ -680,15 +723,17 @@ Jab tak is payment ko verify/reject nahi kar dete, aap naya payment create nahi 
             """
 
         try:
-            bot.delete_message(chat_id, call.message.message_id)
+            bot.delete_message(chat_id, msg_id)
         except:
             pass
+        if msg_id in user_all_messages.get(str(chat_id), []):
+            user_all_messages[str(chat_id)].remove(msg_id)
 
-        bot.send_message(chat_id, msg, parse_mode="HTML")
+        m = bot.send_message(chat_id, msg, parse_mode="HTML")
+        track_msg(chat_id, m.message_id)
         bot.answer_callback_query(call.id)
         return
 
-    # Find plan
     plan = None
     if plan_type in config.PLANS:
         plan = config.PLANS[plan_type]
@@ -700,12 +745,10 @@ Jab tak is payment ko verify/reject nahi kar dete, aap naya payment create nahi 
         bot.answer_callback_query(call.id, "❌ Plan not found!", show_alert=True)
         return
 
-    # Increment total orders for sequential order number
     settings['total_orders'] = settings.get('total_orders', 0) + 1
     order_num = settings['total_orders']
     save_settings()
 
-    # Store in pending verifications
     pending_verifications[str(user_id)] = {
         'plan': plan_type,
         'amount': plan['amount'],
@@ -714,10 +757,9 @@ Jab tak is payment ko verify/reject nahi kar dete, aap naya payment create nahi 
         'username': call.from_user.username,
         'first_name': call.from_user.first_name
     }
-    
-    # Generate QR code
+
     qr_image = premium_bot.generate_qr_code(settings['upi_id'], plan['amount'], settings['upi_name'])
-    
+
     caption = f"""
 <b>💰 ORDER #{order_num}: PAY ₹{plan['amount']} FOR {plan['name'].upper()}</b>
 
@@ -733,46 +775,60 @@ Jab tak is payment ko verify/reject nahi kar dete, aap naya payment create nahi 
 
 ⏳ <i>This QR will auto-delete in 10 minutes.</i>
     """
-    
+
     keyboard = types.InlineKeyboardMarkup(row_width=1)
-    btn1 = types.InlineKeyboardButton("✅ Payment Done", callback_data="payment_done")
-    btn2 = types.InlineKeyboardButton("🔙 Back", callback_data=f"plan_{plan_type}")
+    btn1 = make_button("✅ Payment Done", callback_data="payment_done")
+    btn2 = make_button("🔙 Back", callback_data=f"plan_{plan_type}")
     keyboard.add(btn1, btn2)
-    
+
     try:
-        bot.delete_message(chat_id, call.message.message_id)
+        bot.delete_message(chat_id, msg_id)
     except: pass
+    if msg_id in user_all_messages.get(str(chat_id), []):
+        user_all_messages[str(chat_id)].remove(msg_id)
 
     if qr_image:
         sent_msg = bot.send_photo(chat_id, photo=qr_image, caption=caption, reply_markup=keyboard, parse_mode="HTML")
+        track_msg(chat_id, sent_msg.message_id)
         delete_message_after_delay(chat_id, sent_msg.message_id, 600, send_timeout_msg=True)
     else:
         sent_msg = bot.send_message(chat_id, caption, reply_markup=keyboard, parse_mode="HTML")
+        track_msg(chat_id, sent_msg.message_id)
         delete_message_after_delay(chat_id, sent_msg.message_id, 600, send_timeout_msg=True)
-    
+
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "back_to_main")
 def handle_back_to_main(call):
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
+
+    clear_all_user_msgs(chat_id)
+
     try:
-        welcome_text = f"""
+        bot.delete_message(chat_id, msg_id)
+    except:
+        pass
+
+    start_demos = settings.get('start_demo_videos', [])
+    if start_demos:
+        start_desc = settings.get('start_demo_desc', "")
+        send_demo_videos(chat_id, start_demos, caption=start_desc)
+
+    welcome_text = f"""
 🔥 <b>PREMIUM CONTENT</b> 🔥
 
 Welcome to the Premium Bot! Access high-quality exclusive content.
 
 👇 <b>Select an option:</b>
         """
-        bot.edit_message_text(
-            welcome_text,
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=verif.main_menu_keyboard(),
-            parse_mode="HTML"
-        )
-    except:
-        handle_start(call.message)
-    bot.answer_callback_query(call.id)
-    
+    m = bot.send_message(
+        chat_id,
+        welcome_text,
+        reply_markup=verif.main_menu_keyboard(),
+        parse_mode="HTML"
+    )
+    track_msg(chat_id, m.message_id)
     bot.answer_callback_query(call.id)
 
 # ========== HOW TO GET REMOVED ==========
@@ -790,33 +846,34 @@ def handle_not_set_alerts(call):
 @bot.callback_query_handler(func=lambda call: call.data == "get_premium")
 def handle_get_premium(call):
     user_id = call.from_user.id
-    
-    # Check membership removed
-        
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
+
     spam_result = check_spam(user_id)
     if spam_result:
-        bot.send_message(call.message.chat.id, spam_result, parse_mode="HTML")
+        m = bot.send_message(chat_id, spam_result, parse_mode="HTML")
+        track_msg(chat_id, m.message_id)
         bot.answer_callback_query(call.id)
         return
-    
+
     reset_spam_counter(user_id)
-    
+
+    clear_user_demos(chat_id)
     try:
-        bot.edit_message_text(
-            "👇 <b>Choose your membership plan:</b>",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=verif.plan_selection_keyboard(),
-            parse_mode="HTML"
-        )
+        bot.delete_message(chat_id, msg_id)
     except:
-        bot.send_message(
-            call.message.chat.id,
-            "👇 <b>Choose your membership plan:</b>",
-            reply_markup=verif.plan_selection_keyboard(),
-            parse_mode="HTML"
-        )
-    
+        pass
+    if msg_id in user_all_messages.get(str(chat_id), []):
+        user_all_messages[str(chat_id)].remove(msg_id)
+
+    m = bot.send_message(
+        chat_id,
+        "👇 <b>Choose your membership plan:</b>",
+        reply_markup=verif.plan_selection_keyboard(),
+        parse_mode="HTML"
+    )
+    track_msg(chat_id, m.message_id)
+
     bot.answer_callback_query(call.id)
 
 # ========== PAYMENT DONE ==========
@@ -824,33 +881,36 @@ def handle_get_premium(call):
 def handle_payment_done(call):
     user_id = call.from_user.id
     chat_id = call.message.chat.id
-    
+    msg_id = call.message.message_id
+
     spam_result = check_spam(user_id)
     if spam_result:
-        bot.send_message(chat_id, spam_result, parse_mode="HTML")
+        m = bot.send_message(chat_id, spam_result, parse_mode="HTML")
+        track_msg(chat_id, m.message_id)
         bot.answer_callback_query(call.id)
         return
-    
+
     reset_spam_counter(user_id)
-    
-    # Check if user has selected a plan
+
     if str(user_id) not in pending_verifications:
         bot.answer_callback_query(
-            call.id, 
-            "Please select a plan first!", 
+            call.id,
+            "Please select a plan first!",
             show_alert=True
         )
         return
-    
-    # Delete previous message
+
     try:
-        bot.delete_message(chat_id, call.message.message_id)
+        bot.delete_message(chat_id, msg_id)
     except:
         pass
-    
-    # Ask for screenshot
-    verif.ask_for_screenshot(chat_id, user_id, pending_verifications[str(user_id)]['plan'])
-    
+    if msg_id in user_all_messages.get(str(chat_id), []):
+        user_all_messages[str(chat_id)].remove(msg_id)
+
+    screenshot_msg = verif.ask_for_screenshot(chat_id, user_id, pending_verifications[str(user_id)]['plan'])
+    if screenshot_msg:
+        track_msg(chat_id, screenshot_msg.message_id)
+
     bot.answer_callback_query(call.id)
 
 # ========== HANDLE SCREENSHOTS & FILE IDs ==========
