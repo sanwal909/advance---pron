@@ -2,6 +2,7 @@ import telebot
 from telebot import types
 import time
 import threading
+import random
 from datetime import datetime, timedelta
 import logging
 
@@ -10,6 +11,17 @@ import config
 from config import *
 
 logger = logging.getLogger(__name__)
+
+BUTTON_COLORS = [None, "primary", "positive", "negative"]
+
+def get_random_button_color():
+    """Return a random button color for Telegram's colored buttons:
+    None = default (white/light)
+    primary = blue
+    positive = green
+    negative = red
+    """
+    return random.choice(BUTTON_COLORS)
 
 class VerificationSystem:
     def __init__(self, bot):
@@ -93,18 +105,31 @@ class VerificationSystem:
             return f"Error creating link: {str(e)}"
 
     def plan_selection_keyboard(self):
-        """Dynamic Membership keyboard"""
+        """Dynamic Membership keyboard with random button colors"""
         keyboard = types.InlineKeyboardMarkup(row_width=1)
         
         channels = settings.get("premium_channels", [])
         for ch in channels:
-            keyboard.add(types.InlineKeyboardButton(f"🔗 {ch['name']} - ₹{ch['amount']}", callback_data=f"plan_{ch['id']}"))
+            btn = types.InlineKeyboardButton(
+                f"🔗 {ch['name']} - ₹{ch['amount']}",
+                callback_data=f"plan_{ch['id']}"
+            )
+            try:
+                btn.button_color = get_random_button_color()
+            except:
+                pass
+            keyboard.add(btn)
             
-        keyboard.add(types.InlineKeyboardButton("⬅️ Back to Menu", callback_data="main_menu"))
+        back_btn = types.InlineKeyboardButton("⬅️ Back to Menu", callback_data="main_menu")
+        try:
+            back_btn.button_color = get_random_button_color()
+        except:
+            pass
+        keyboard.add(back_btn)
         return keyboard
 
     def main_menu_keyboard(self):
-        """Main menu with premium channels shown directly"""
+        """Main menu with premium channels shown directly + random button colors"""
         keyboard = types.InlineKeyboardMarkup(row_width=1)
         
         # 1. Free Video Channel
@@ -113,24 +138,47 @@ class VerificationSystem:
         demo_link = settings.get('demo_channel_link', '')
         
         if is_paid:
-            keyboard.add(types.InlineKeyboardButton(f"📢 Free Video Channel (₹{demo_amount})", callback_data="plan_demo"))
+            btn = types.InlineKeyboardButton(f"📢 Free Video Channel (₹{demo_amount})", callback_data="plan_demo")
+            try: btn.button_color = get_random_button_color()
+            except: pass
+            keyboard.add(btn)
         elif demo_link:
-            keyboard.add(types.InlineKeyboardButton("📢 Free Video Channel", url=demo_link))
+            btn = types.InlineKeyboardButton("📢 Free Video Channel", url=demo_link)
+            try: btn.button_color = get_random_button_color()
+            except: pass
+            keyboard.add(btn)
         else:
-            keyboard.add(types.InlineKeyboardButton("📢 Free Video Channel (Not Set)", callback_data="demo_not_set"))
+            btn = types.InlineKeyboardButton("📢 Free Video Channel (Not Set)", callback_data="demo_not_set")
+            try: btn.button_color = get_random_button_color()
+            except: pass
+            keyboard.add(btn)
             
         # 2. Premium Channels (Directly shown)
         channels = settings.get("premium_channels", [])
         for ch in channels:
-            keyboard.add(types.InlineKeyboardButton(f" {ch['name']} - ₹{ch['amount']}", callback_data=f"plan_{ch['id']}"))
+            btn = types.InlineKeyboardButton(
+                f" {ch['name']} - ₹{ch['amount']}",
+                callback_data=f"plan_{ch['id']}"
+            )
+            try:
+                btn.button_color = get_random_button_color()
+            except:
+                pass
+            keyboard.add(btn)
         
         # 3. Payment Proof Channel
         if settings.get("payment_proof_status", True):
             proof_link = settings.get('payment_proof_link', '')
             if proof_link:
-                keyboard.add(types.InlineKeyboardButton("🧾 Payment Proofs", url=proof_link))
+                btn = types.InlineKeyboardButton("🧾 Payment Proofs", url=proof_link)
+                try: btn.button_color = get_random_button_color()
+                except: pass
+                keyboard.add(btn)
             else:
-                keyboard.add(types.InlineKeyboardButton("🧾 Payment Proofs (Not Set)", callback_data="proof_not_set"))
+                btn = types.InlineKeyboardButton("🧾 Payment Proofs (Not Set)", callback_data="proof_not_set")
+                try: btn.button_color = get_random_button_color()
+                except: pass
+                keyboard.add(btn)
 
         return keyboard
     
@@ -215,13 +263,21 @@ Jab tak admin purane payment ko verify/reject nahi kar dete, aap naya screenshot
         # Create verification buttons for admin
         keyboard = types.InlineKeyboardMarkup(row_width=2)
         verify_btn = types.InlineKeyboardButton(
-            "✅ Verify Payment", 
+            "✅ Verify Payment",
             callback_data=f"verify_{user_id}"
         )
         reject_btn = types.InlineKeyboardButton(
-            "❌ Reject", 
+            "❌ Reject",
             callback_data=f"reject_{user_id}"
         )
+        try:
+            verify_btn.button_color = "positive"  # green
+        except:
+            pass
+        try:
+            reject_btn.button_color = "negative"  # red
+        except:
+            pass
         keyboard.add(verify_btn, reject_btn)
         
         # Forward screenshot to admin log channel
