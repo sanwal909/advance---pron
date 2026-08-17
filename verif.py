@@ -23,6 +23,16 @@ def get_random_button_color():
     """
     return random.choice(BUTTON_COLORS)
 
+def make_colored_button(text, **kwargs):
+    """Create InlineKeyboardButton with random color (passed in constructor for proper serialization).
+    Only callback buttons get color (not URL buttons).
+    """
+    if 'url' not in kwargs:
+        color = get_random_button_color()
+        if color is not None:
+            kwargs['button_color'] = color
+    return types.InlineKeyboardButton(text, **kwargs)
+
 class VerificationSystem:
     def __init__(self, bot):
         self.bot = bot
@@ -110,74 +120,64 @@ class VerificationSystem:
         
         channels = settings.get("premium_channels", [])
         for ch in channels:
-            btn = types.InlineKeyboardButton(
+            btn = make_colored_button(
                 f"🔗 {ch['name']} - ₹{ch['amount']}",
                 callback_data=f"plan_{ch['id']}"
             )
-            try:
-                btn.button_color = get_random_button_color()
-            except:
-                pass
             keyboard.add(btn)
-            
-        back_btn = types.InlineKeyboardButton("⬅️ Back to Menu", callback_data="main_menu")
-        try:
-            back_btn.button_color = get_random_button_color()
-        except:
-            pass
+
+        back_btn = make_colored_button("⬅️ Back to Menu", callback_data="main_menu")
         keyboard.add(back_btn)
         return keyboard
 
     def main_menu_keyboard(self):
-        """Main menu with premium channels shown directly + random button colors"""
+        """Main menu with premium channels shown directly + random button colors + Contact Support"""
         keyboard = types.InlineKeyboardMarkup(row_width=1)
-        
+
         # 1. Free Video Channel
         is_paid = settings.get('demo_paid_status', False)
         demo_amount = settings.get('demo_amount', '10')
         demo_link = settings.get('demo_channel_link', '')
-        
+
         if is_paid:
-            btn = types.InlineKeyboardButton(f"📢 Free Video Channel (₹{demo_amount})", callback_data="plan_demo")
-            try: btn.button_color = get_random_button_color()
-            except: pass
+            btn = make_colored_button(f"📢 Free Video Channel (₹{demo_amount})", callback_data="plan_demo")
             keyboard.add(btn)
         elif demo_link:
             btn = types.InlineKeyboardButton("📢 Free Video Channel", url=demo_link)
-            try: btn.button_color = get_random_button_color()
-            except: pass
             keyboard.add(btn)
         else:
-            btn = types.InlineKeyboardButton("📢 Free Video Channel (Not Set)", callback_data="demo_not_set")
-            try: btn.button_color = get_random_button_color()
-            except: pass
+            btn = make_colored_button("📢 Free Video Channel (Not Set)", callback_data="demo_not_set")
             keyboard.add(btn)
-            
+
         # 2. Premium Channels (Directly shown)
         channels = settings.get("premium_channels", [])
         for ch in channels:
-            btn = types.InlineKeyboardButton(
-                f" {ch['name']} - ₹{ch['amount']}",
+            btn = make_colored_button(
+                f"💎 {ch['name']} - ₹{ch['amount']}",
                 callback_data=f"plan_{ch['id']}"
             )
-            try:
-                btn.button_color = get_random_button_color()
-            except:
-                pass
             keyboard.add(btn)
-        
+
         # 3. Payment Proof Channel
         if settings.get("payment_proof_status", True):
             proof_link = settings.get('payment_proof_link', '')
             if proof_link:
                 btn = types.InlineKeyboardButton("🧾 Payment Proofs", url=proof_link)
-                try: btn.button_color = get_random_button_color()
-                except: pass
                 keyboard.add(btn)
             else:
-                btn = types.InlineKeyboardButton("🧾 Payment Proofs (Not Set)", callback_data="proof_not_set")
-                try: btn.button_color = get_random_button_color()
-                except: pass
+                btn = make_colored_button("🧾 Payment Proofs (Not Set)", callback_data="proof_not_set")
+                keyboard.add(btn)
+
+        # 4. Contact Support (only if status ON)
+        if settings.get("support_status", True):
+            support_uname = settings.get('support_username', '')
+            if support_uname:
+                uname_clean = support_uname.lstrip('@')
+                support_url = f"https://t.me/{uname_clean}"
+                btn = types.InlineKeyboardButton("📞 Contact Support", url=support_url)
+                keyboard.add(btn)
+            else:
+                btn = make_colored_button("📞 Contact Support (Not Set)", callback_data="support_not_set")
                 keyboard.add(btn)
 
         return keyboard
@@ -264,20 +264,14 @@ Jab tak admin purane payment ko verify/reject nahi kar dete, aap naya screenshot
         keyboard = types.InlineKeyboardMarkup(row_width=2)
         verify_btn = types.InlineKeyboardButton(
             "✅ Verify Payment",
-            callback_data=f"verify_{user_id}"
+            callback_data=f"verify_{user_id}",
+            button_color="positive"
         )
         reject_btn = types.InlineKeyboardButton(
             "❌ Reject",
-            callback_data=f"reject_{user_id}"
+            callback_data=f"reject_{user_id}",
+            button_color="negative"
         )
-        try:
-            verify_btn.button_color = "positive"  # green
-        except:
-            pass
-        try:
-            reject_btn.button_color = "negative"  # red
-        except:
-            pass
         keyboard.add(verify_btn, reject_btn)
         
         # Forward screenshot to admin log channel
