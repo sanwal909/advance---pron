@@ -15,7 +15,7 @@ import sys
 # Import config and verification
 import config
 from config import *
-from verif import init_verification, get_random_button_color
+from verif import init_verification, get_random_button_color, make_colored_button
 
 # Initialize bot
 # Use config.BOT_TOKEN to avoid NameError if star import hasn't processed it yet
@@ -38,14 +38,12 @@ def rnd_color():
     return random.choice(BUTTON_COLORS_BOT)
 
 def make_button(text, **kwargs):
-    """Create InlineKeyboardButton with random color if no url"""
-    btn = types.InlineKeyboardButton(text, **kwargs)
-    if 'url' not in kwargs:
-        try:
-            btn.button_color = rnd_color()
-        except:
-            pass
-    return btn
+    """Create InlineKeyboardButton with random color if no url (color passed in constructor)"""
+    if 'url' not in kwargs and 'button_color' not in kwargs:
+        color = rnd_color()
+        if color is not None:
+            kwargs['button_color'] = color
+    return types.InlineKeyboardButton(text, **kwargs)
 
 def is_admin(user_id):
     """Check if a user is an admin"""
@@ -1064,6 +1062,10 @@ def handle_settings(message):
 <b>🛡️ Force Join:</b> {'ON' if settings.get('force_join_status', True) else 'OFF'}
 <b>🤖 Auto-Accept:</b> {'ON' if settings.get('auto_accept_requests', False) else 'OFF'}
 
+<b>📞 Support:</b>
+• Username: @{settings.get('support_username', 'Not Set') or 'Not Set'}
+• Status: {'ON' if settings.get('support_status', True) else 'OFF'}
+
 <b>💰 UPI Settings:</b>
 • UPI ID: <code>{settings.get('upi_id', 'Not Set')}</code>
 • Name: {settings.get('upi_name', 'Not Set')}
@@ -1498,6 +1500,18 @@ def handle_proof_toggle(message):
 
     status = "ON" if settings["payment_proof_status"] else "OFF"
     bot.reply_to(message, f"✅ Payment Proof button is now <b>{status}</b>.", parse_mode="HTML")
+
+@bot.message_handler(commands=['support_toggle'])
+def handle_support_toggle(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    current = settings.get("support_status", True)
+    settings["support_status"] = not current
+    save_settings()
+
+    status = "ON" if settings["support_status"] else "OFF"
+    bot.reply_to(message, f"✅ Contact Support button is now <b>{status}</b>.", parse_mode="HTML")
 
 @bot.message_handler(commands=['set_proof_link'])
 def handle_set_proof_link(message):
@@ -2390,87 +2404,187 @@ def handle_set_proof_channel(message):
 # ========== /HELP COMMAND (FIXED HTML) ==========
 @bot.message_handler(commands=['help'])
 def handle_help(message):
-    """Show help message"""
+    """Show help message with ALL commands"""
     if not is_admin(message.from_user.id):
-        # User help
+        # ========== USER HELP (ALL commands) ==========
+        support_uname = settings.get('support_username', '')
+        support_info = f"@{support_uname.lstrip('@')}" if support_uname else "Not Set"
+        demo_link = settings.get('demo_channel_link', '') or "Not Set"
+        proof_link = settings.get('payment_proof_link', '') or "Not Set"
+        support_on = settings.get('support_status', True)
+        proof_on = settings.get('payment_proof_status', True)
+
         user_help = f"""
-<b>🤖 Bot Commands:</b>
+<b>📋 ALL USER COMMANDS</b>
 
-/start - Start the bot
-/help - Show this help
+━━━━━━━━━━━━━━━
+<b>🔹 BASIC COMMANDS:</b>
+/start  - Start the bot / Show Main Menu
+/help   - Show this complete help message
 
-For premium: Click "Get Premium" button
+━━━━━━━━━━━━━━━
+<b>🔹 QUICK LINKS:</b>
+📢 Demo Channel: {demo_link}
+🧾 Payment Proofs: {proof_link} {'<i>(OFF)</i>' if not proof_on else ''}
+📞 Contact Support: {support_info} {'<i>(OFF)</i>' if not support_on else ''}
 
-<b>Demo Channel:</b> {settings['demo_channel_link']}
+━━━━━━━━━━━━━━━
+<b>🔹 HOW TO BUY PREMIUM:</b>
+1. Send <code>/start</code> → Click any <b>💎 Premium Channel</b> button
+2. Click <b>💳 Buy Now</b> → Scan QR / Pay via UPI
+3. Send <b>payment screenshot</b> as photo
+4. Admin will verify & send unique join link
+
+━━━━━━━━━━━━━━━
+<b>💡 TIPS:</b>
+• Use Main Menu buttons for quick access
+• If you have pending payment, wait for admin verification
+• For any issue click <b>📞 Contact Support</b> button
         """
-        bot.reply_to(message, user_help, parse_mode="HTML")
+        # Split if too long
+        if len(user_help) > 4000:
+            parts = [user_help[i:i+4000] for i in range(0, len(user_help), 4000)]
+            for part in parts:
+                bot.send_message(message.chat.id, part, parse_mode="HTML")
+        else:
+            bot.reply_to(message, user_help, parse_mode="HTML")
         return
-    
-    # Admin help
+
+    # ========== ADMIN HELP (ALL commands) ==========
     admin_help = """
-<b>👮 ADMIN COMMANDS</b>
+<b>📋 COMPLETE ADMIN COMMANDS LIST</b>
 
-<b>📋 VERIFICATION:</b>
-/pending - Show pending verifications
-/verify [user_id] - Manual verify
-/clear_all_payments - Clear ALL payments (pending + sales records) with order numbers
+━━━━━━━━━━━━━━━
+<b>🔹 BASIC:</b>
+/start   - Start bot / Main Menu
+/help    - Show this complete help
+/settings - View ALL current settings
 
-<b>⚙️ SETTINGS:</b>
-/settings - View all settings
-/set [key] [value] - Change setting
+━━━━━━━━━━━━━━━
+<b>🔹 PAYMENT VERIFICATION:</b>
+/pending     - Show ALL pending verifications (list)
+/verify [user_id] - Manually verify a pending user
+/clear_all_payments - Delete ALL pending + sales records (resets order numbers)
 
-<b>💰 PRICE MANAGEMENT:</b>
-/set_price single [amount] - Set single channel price (e.g. /set_price single 99)
-/set_price all [amount] - Set all channels price (e.g. /set_price all 299)
-/demo_price [amount] - Set demo price
-/set_demo_ch [channel_id] - Set demo channel ID
-/set_demo_link [url] - Set demo link
-/demo_toggle - Toggle demo between FREE and PAID
+━━━━━━━━━━━━━━━
+<b>🔹 QUICK SETTINGS (/set):</b>
+Use: <code>/set [key] [value]</code>
+<b>Available keys:</b>
+  demo_channel  - Demo channel link
+  support       - Support username (e.g. @my_support)
+  log_channel   - Admin log channel ID
+  upi_id        - Your UPI ID
+  upi_name      - Your name (shown in QR)
+  monthly_name  - Legacy plan name
+  monthly_amount - Legacy price
+  monthly_channel - Legacy channel ID
+  lifetime_name  - Legacy plan name
+  lifetime_amount - Legacy price
+  lifetime_channel - Legacy channel ID
+<b>Example:</b> <code>/set support @custom_support</code>
+
+━━━━━━━━━━━━━━━
+<b>🔹 DEMO CHANNEL SETTINGS:</b>
+/demo_toggle        - Toggle demo between FREE/PAID
+/demo_price [amt]   - Set demo price (e.g. /demo_price 10)
+/set_demo_ch [id]   - Set demo channel ID (for invite link)
+/set_demo_link [url] - Set demo channel link (direct URL)
+
+━━━━━━━━━━━━━━━
+<b>🔹 PAYMENT PROOF SETTINGS:</b>
+/proof_toggle        - Toggle 🧾 Payment Proofs button ON/OFF
 /set_proof_link [url] - Set payment proof channel link
-/set_proof_channel [id] - Set proof channel ID (auto-sends verified proofs here)
-/proof_toggle - Toggle payment proof button ON/OFF
-/set_backup_ch [id] - Set backup channel for videos
+/set_proof_channel [id] - Set proof channel ID (auto-post verified proofs)
 
-<b>📺 CHANNEL MANAGEMENT:</b>
-/add_premium_ch id Full Name price channel_id - Add new channel
-/remove_premium_ch id - Remove channel
-/edit_premium_ch id key New Value - Edit channel (name, amount, channel_id, duration, description)
-/set_start_demos [v1] [v2]... - Set start demos
-/clear_start_demos - Clear start demos
-/set_plan_demos [plan] [v1]... - Set plan demos
-/clear_plan_demos [plan] - Clear plan demos
-/set_demo_desc [id] [desc] - Set album caption
-/clear_demo_desc [id] - Clear album caption
+━━━━━━━━━━━━━━━
+<b>🔹 CONTACT SUPPORT SETTINGS:</b>
+/support_toggle      - Toggle 📞 Contact Support button ON/OFF
+/set support @uname  - Set support username (via /set)
 
-<b>📢 BROADCAST:</b>
-/broadcast (reply) - Broadcast message (supports: Text, Photo, Video, Doc, GIF, Audio, Voice)
+━━━━━━━━━━━━━━━
+<b>🔹 PREMIUM CHANNEL MANAGEMENT:</b>
+/add_premium_ch [id] [Full Name] [price] [channel_id]
+    → Add new premium channel
+    → <b>Example:</b> <code>/add_premium_ch ch8 Pro Movies 199 -1001234567890</code>
 
-<b>📊 DATA:</b>
-/stats - Bot statistics
-/sales - View daily/weekly/monthly sales report
-/migrate_to_mongo - Force sync JSON files to MongoDB
-/imp_to_mongo (reply) - Import specific JSON file to MongoDB
-/exportdata - Export users data
-/impdata (reply) - Import data
-/backup - Create backup
-/savedata - Force save
-/cleanbackups - Clean old backups
+/remove_premium_ch [id]
+    → Remove a channel (e.g. /remove_premium_ch ch8)
 
-<b>👑 ADMIN MANAGEMENT:</b>
-/add_admin [user_id] - Add new admin
-/remove_admin [user_id] - Remove admin
-/settings - View all settings
+/edit_premium_ch [id] [key] [New Value]
+    → <b>Keys:</b> name, amount, channel_id, duration, description
+    → <b>Example:</b> <code>/edit_premium_ch ch1 amount 149</code>
 
-<b>✏️ START MESSAGE:</b>
-/setstartmsg (reply) - Set custom start
-/getstartmsg - View current
-/clearstartmsg - Clear custom
+/set_price single [amt]  - Legacy single channel price
+/set_price all [amt]     - Legacy all channels price
+/set_ch [plan] [id]      - Legacy set channel id
 
-<b>ℹ️ OTHER:</b>
-/help - Show this help
+━━━━━━━━━━━━━━━
+<b>🔹 DEMO VIDEO / CONTENT SETUP:</b>
+/set_backup_ch [channel_id] - Backup channel for auto-storing videos
+
+<b>Start Screen Demos (shown after /start):</b>
+/set_start_demos [file_id1] [file_id2] ... - Set start demo videos (or reply to media)
+/clear_start_demos - Clear all start demos
+
+<b>Plan-Wise Demos (shown inside plan):</b>
+/set_plan_demos [plan_id] [file_id1] ... - Set plan demos (or reply to media)
+/clear_plan_demos [plan_id] - Clear specific plan demos
+
+<b>Album Captions (Descriptions):</b>
+/set_demo_desc [id] [text]  - Set album caption (start_demo or plan_id)
+/clear_demo_desc [id]       - Clear album caption
+
+━━━━━━━━━━━━━━━
+<b>🔹 CUSTOM START MESSAGE:</b>
+/setstartmsg  (reply to any message/text/photo) - Set custom /start message
+/getstartmsg   - View current custom start message
+/clearstartmsg - Reset to default start message
+
+━━━━━━━━━━━━━━━
+<b>🔹 BROADCAST:</b>
+/broadcast (reply to a message)
+    → Send message to ALL bot users
+    → <b>Supports:</b> Text, Photo, Video, Document, GIF, Audio, Voice
+    → <b>How:</b> Send message first → Reply to it with <code>/broadcast</code>
+
+━━━━━━━━━━━━━━━
+<b>🔹 STATISTICS & REPORTS:</b>
+/stats  - Bot statistics (Total users, pending, sales, orders, etc.)
+/sales  - Daily / Weekly / Monthly sales report with graphs-like summary
+
+━━━━━━━━━━━━━━━
+<b>🔹 ADMIN MANAGEMENT:</b>
+/add_admin [user_id]    - Make someone admin
+/remove_admin [user_id] - Remove from admins
+/settings               - View all settings in one place
+
+━━━━━━━━━━━━━━━
+<b>🔹 DATA MANAGEMENT (BACKUP / EXPORT / IMPORT):</b>
+/savedata       - Force save ALL data to JSON + MongoDB
+/backup         - Create timestamped backup file (all JSONs)
+/cleanbackups   - Delete old backup files (keeps only recent)
+/exportdata     - Export users data as JSON file
+
+/impdata (reply to JSON file)  - Import users data from backup
+/migrate_to_mongo              - Force sync ALL JSON files to MongoDB
+/imp_to_mongo (reply to JSON)  - Import specific JSON file to MongoDB
+
+━━━━━━━━━━━━━━━
+<b>🔹 OTHER / LEGACY:</b>
+/ban       → ❌ Ban system removed
+/unban     → ❌ Ban system removed
+/banlist   → ❌ Ban system removed
+
+━━━━━━━━━━━━━━━
+<b>💡 QUICK START (NEW SETUP):</b>
+1. <code>/set support @your_username</code>
+2. <code>/set upi_id your@upi</code>
+3. <code>/set log_channel -100xxxx</code>
+4. Add channels → <code>/add_premium_ch ...</code>
+5. <code>/settings</code> - Verify everything
     """
-    
-    # Split if too long
+
+    # Split if too long (Telegram limit ~4096)
     if len(admin_help) > 4000:
         parts = [admin_help[i:i+4000] for i in range(0, len(admin_help), 4000)]
         for part in parts:
