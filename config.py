@@ -155,6 +155,8 @@ DEFAULT_SETTINGS = {
     "demo_amount": "10",
     "payment_proof_link": "",
     "payment_proof_status": True,
+    "support_username": "",
+    "support_status": True,
     "how_to_buy_url": "",
     "total_orders": 0,
     "start_demo_videos": [],
@@ -257,6 +259,14 @@ save_json_file(SETTINGS_FILE, settings)
 # Migration: Ensure proof_channel_id exists
 if 'proof_channel_id' not in settings:
     settings['proof_channel_id'] = ""
+    save_json_file(SETTINGS_FILE, settings)
+
+# Migration: Ensure support_username and support_status exist
+if 'support_username' not in settings:
+    settings['support_username'] = ""
+    save_json_file(SETTINGS_FILE, settings)
+if 'support_status' not in settings:
+    settings['support_status'] = True
     save_json_file(SETTINGS_FILE, settings)
 
 # Update PLANS with settings
