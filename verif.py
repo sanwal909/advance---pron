@@ -12,6 +12,20 @@ from config import *
 
 logger = logging.getLogger(__name__)
 
+# ========== BUTTON COLOR FIX (to_dict patch - same in bot.py) ==========
+_original_ikb_to_dict_verif = types.InlineKeyboardButton.to_dict
+def _patched_ikb_to_dict_verif(self):
+    json_dict = _original_ikb_to_dict_verif(self)
+    extra_color = getattr(self, 'button_color', None)
+    if extra_color is not None:
+        json_dict['color'] = extra_color
+    if not json_dict.get('color'):
+        extra_color2 = getattr(self, 'color', None)
+        if extra_color2 is not None:
+            json_dict['color'] = extra_color2
+    return json_dict
+types.InlineKeyboardButton.to_dict = _patched_ikb_to_dict_verif
+
 BUTTON_COLORS = [None, "primary", "positive", "negative"]
 
 def get_random_button_color():
@@ -44,35 +58,39 @@ class VerificationSystem:
         pass
     
     def create_invite_link(self, user_id, plan_type):
-        """Create unique invite link(s) for specific channel(s) based on plan"""
+        """Create TWO unique invite links per channel for specific plan.
+        Each link has member_limit=1 (single-use) so user gets 2 separate links.
+        """
         global invite_links
         try:
             plan = config.PLANS[plan_type]
-            
+            INVITES_PER_CHANNEL = 2  # 2 links per channel
+
             # Special case for "all" channels
             if plan_type == "all":
                 channel_ids = plan.get('channel_ids', [])
                 valid_links = []
                 for idx, cid in enumerate(channel_ids, 1):
                     if not cid: continue
-                    try:
-                        invite = self.bot.create_chat_invite_link(
-                            chat_id=int(cid),
-                            member_limit=2,
-                            expire_date=datetime.now() + timedelta(days=365)
-                        )
-                        valid_links.append(f"Channel {idx}: {invite.invite_link}")
-                    except Exception as e:
-                        logger.error(f"Error creating invite for {cid}: {e}")
-                
+                    for link_num in range(1, INVITES_PER_CHANNEL + 1):
+                        try:
+                            invite = self.bot.create_chat_invite_link(
+                                chat_id=int(cid),
+                                member_limit=1,  # each link = 1 use
+                                expire_date=datetime.now() + timedelta(days=365)
+                            )
+                            valid_links.append(f"Channel {idx} - Link {link_num}: {invite.invite_link}")
+                        except Exception as e:
+                            logger.error(f"Error creating invite for {cid} (link #{link_num}): {e}")
+
                 if not valid_links:
                     return "Error: No channel IDs configured for All Channels. Contact admin."
-                
+
                 # Store links
                 user_id_str = str(user_id)
                 if user_id_str not in invite_links:
                     invite_links[user_id_str] = []
-                
+
                 link_data = {
                     'plan': plan_type,
                     'links': valid_links,
@@ -80,7 +98,7 @@ class VerificationSystem:
                 }
                 invite_links[user_id_str].append(link_data)
                 # save_json_file(INVITE_LINKS_FILE, invite_links) # Removed for batch saving
-                
+
                 return "\n".join(valid_links)
 
             # Standard case for single channel
@@ -88,28 +106,40 @@ class VerificationSystem:
             if not channel_id:
                 # Special fallback for demo if ID is missing but link exists
                 if plan_type == "demo" and settings.get('demo_channel_link'):
-                    return settings.get('demo_channel_link')
-                return f"Error: Channel ID not configured for {plan['name']}. Contact admin."
-            
-            expire_date = datetime.now() + timedelta(days=365)
-            invite = self.bot.create_chat_invite_link(
-                chat_id=int(channel_id),
-                member_limit=2,
-                expire_date=expire_date
-            )
-            
+                    demo_link = settings.get('demo_channel_link')
+                    return f"Link 1: {demo_link}\nLink 2: {demo_link}"
+                return "Error: Channel ID not configured. Contact admin."
+
+            # Create TWO invite links for single channel
+            valid_links = []
+            for link_num in range(1, INVITES_PER_CHANNEL + 1):
+                try:
+                    invite = self.bot.create_chat_invite_link(
+                        chat_id=int(channel_id),
+                        member_limit=1,  # each link = 1 use
+                        expire_date=datetime.now() + timedelta(days=365)
+                    )
+                    valid_links.append(f"Link {link_num}: {invite.invite_link}")
+                except Exception as e:
+                    logger.error(f"Error creating invite #{link_num} for {channel_id}: {e}")
+
+            if not valid_links:
+                return "Error: Failed to create invite links. Contact admin."
+
+            # Store links
             user_id_str = str(user_id)
             if user_id_str not in invite_links:
                 invite_links[user_id_str] = []
-            
-            invite_links[user_id_str].append({
+
+            link_data = {
                 'plan': plan_type,
-                'link': invite.invite_link,
+                'links': valid_links,
                 'time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            })
+            }
+            invite_links[user_id_str].append(link_data)
             # save_json_file(INVITE_LINKS_FILE, invite_links) # Removed for batch saving
-            
-            return invite.invite_link
+
+            return "\n".join(valid_links)
         except Exception as e:
             logger.error(f"Invite Link Error: {e}")
             return f"Error creating link: {str(e)}"
@@ -187,7 +217,11 @@ class VerificationSystem:
         plan = config.PLANS[plan_type]
         pending_data = self.pending.get(str(user_id), {})
         order_num = pending_data.get('order_number', 'N/A')
-        
+
+        # Mark the time when user was asked for screenshot (for auto-cleanup)
+        pending_data['screenshot_requested_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.save_pending()
+
         msg = self.bot.send_message(
             chat_id,
             f"""
@@ -203,7 +237,7 @@ Now please send the <b>payment screenshot</b> for verification.
 
 <b>Instructions:</b>
 1. Take screenshot of UPI payment
-2. Send it here as photo
+2. Send it here as <b>PHOTO / IMAGE</b> (NOT as a File/Document)
 3. Admin will verify within few minutes
 4. You'll receive unique join link after verification
 
@@ -373,10 +407,12 @@ You'll receive unique join link within few minutes.
 <b>Plan:</b> {plan['name']}
 <b>Amount Paid:</b> ₹{plan['amount']}
 
-<b>👇 Your Unique Demo Invite Link (2 Uses):</b>
+<b>👇 Your Invite Links (2 Links, 1 use each):</b>
 {invite_link}
 
-⚠️ <b>Note:</b> This link can be used up to 2 TIMES.
+⚠️ <b>Note:</b> You got <b>2 SEPARATE LINKS</b> — each link works only <b>1 TIME</b>.
+   • Link 1 → Use for yourself
+   • Link 2 → Share with 1 friend / family
 📅 <b>Access Duration:</b> {plan.get('duration', '30 Days')}
 
 <b>Enjoy your demo! 🍿</b>
@@ -388,10 +424,12 @@ You'll receive unique join link within few minutes.
 <b>Plan:</b> {plan['name']}
 <b>Amount Paid:</b> ₹{plan['amount']}
 
-<b>👇 Your Unique Invite Link (2 Uses):</b>
+<b>👇 Your Invite Links (2 Links, 1 use each):</b>
 {invite_link}
 
-⚠️ <b>Note:</b> This link can be used up to 2 TIMES and is personal to you.
+⚠️ <b>Important:</b> You received <b>2 UNIQUE LINKS</b> — each link works for <b>ONLY 1 PERSON</b>.
+   • <b>Link 1:</b> Join yourself
+   • <b>Link 2:</b> Share with a friend / family (one more person)
 📅 <b>Access Duration:</b> {plan.get('duration', '30 Days')}
 
 <b>Welcome to Premium Family! 🎊</b>
