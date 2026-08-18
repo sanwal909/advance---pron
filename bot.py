@@ -28,6 +28,23 @@ if not _token or ":" not in _token:
 
 bot = telebot.TeleBot(_token, parse_mode="HTML")
 
+# ========== BUTTON COLOR FIX (to_dict patch for Telegram Bot API Mini Apps colors) ==========
+# pyTelegramBotAPI doesn't include button_color in to_dict() by default
+_original_ikb_to_dict = types.InlineKeyboardButton.to_dict
+def _patched_ikb_to_dict(self):
+    json_dict = _original_ikb_to_dict(self)
+    # Add button_color if set (supports: primary, positive, negative, default=None)
+    extra_color = getattr(self, 'button_color', None)
+    if extra_color is not None:
+        json_dict['color'] = extra_color
+    # Also try alternate name for compatibility
+    if not json_dict.get('color'):
+        extra_color2 = getattr(self, 'color', None)
+        if extra_color2 is not None:
+            json_dict['color'] = extra_color2
+    return json_dict
+types.InlineKeyboardButton.to_dict = _patched_ikb_to_dict
+
 # Initialize verification system
 verif = init_verification(bot)
 
@@ -77,6 +94,66 @@ def auto_save_data():
 
 auto_save_thread = threading.Thread(target=auto_save_data, daemon=True)
 auto_save_thread.start()
+
+# Auto-clean expired pending payments (no proof uploaded after QR generated / after ask_for_screenshot)
+# Silent cancel: no message to user, no admin alert. Just removes pending entry.
+PENDING_PROOF_TIMEOUT_SEC = 600  # 10 minutes (same as QR auto-delete)
+PENDING_INITIATED_TIMEOUT_SEC = 900  # 15 minutes (after QR generated, user clicked Payment Done but never send proof)
+
+def auto_clean_pending_payments():
+    while True:
+        try:
+            now = datetime.now()
+            removed_count = 0
+            to_delete = []
+
+            for user_id_str, pending_data in pending_verifications.items():
+                # Case 1: Screenshot already uploaded → admin will handle, do NOT auto-cancel
+                if pending_data.get('screenshot_file_id'):
+                    continue
+
+                initiated_str = pending_data.get('initiated_at')
+                screenshot_req_str = pending_data.get('screenshot_requested_at')
+
+                # Decide which timestamp to use (use latest available)
+                check_time_str = None
+                timeout = PENDING_INITIATED_TIMEOUT_SEC
+                if screenshot_req_str:
+                    check_time_str = screenshot_req_str
+                    timeout = PENDING_PROOF_TIMEOUT_SEC  # after asking screenshot - wait 10 min
+                elif initiated_str:
+                    check_time_str = initiated_str
+
+                if check_time_str:
+                    try:
+                        check_time = datetime.strptime(check_time_str, "%Y-%m-%d %H:%M:%S")
+                        if (now - check_time).total_seconds() > timeout:
+                            to_delete.append(user_id_str)
+                    except Exception as e:
+                        logging.warning(f"Pending parse time error: {e}")
+
+            for uid in to_delete:
+                del pending_verifications[uid]
+                removed_count += 1
+
+            if removed_count > 0:
+                # Save to both JSON and MongoDB (silent)
+                try:
+                    save_json_file(PENDING_VERIF_FILE, pending_verifications)
+                except:
+                    pass
+                logging.info(f"🧹 Auto-cleaned {removed_count} expired pending payments (no proof uploaded).")
+
+        except Exception as e:
+            logging.error(f"Auto clean pending error: {e}")
+
+        # Run every 60 seconds
+        time.sleep(60)
+
+# Start cleanup thread
+_pending_cleanup_thread = threading.Thread(target=auto_clean_pending_payments, daemon=True)
+_pending_cleanup_thread.start()
+logging.info("🧹 Auto-clean pending payments thread started (10min timeout, no user msg).")
 
 # Notify Admin about MongoDB status on startup
 def notify_mongo_status():
@@ -915,7 +992,34 @@ def handle_payment_done(call):
 @bot.message_handler(content_types=['photo', 'video', 'document'])
 def handle_admin_files(message):
     user_id = message.from_user.id
-    
+    user_id_str = str(user_id)
+
+    # 0. NORMAL USER WITH PENDING → If they send DOCUMENT/VIDEO instead of PHOTO
+    if not is_admin(user_id) and user_id_str in pending_verifications:
+        pending_data = pending_verifications[user_id_str]
+        if not pending_data.get('screenshot_file_id'):
+            # Wants to upload proof but sent wrong type
+            if message.document or message.video:
+                bot.reply_to(
+                    message,
+                    """❌ <b>WRONG FORMAT!</b>
+
+Aapne payment proof ko <b>File / Document / Video</b> ke roop mein bheja hai.
+
+✅ <b>Sahi tareeka:</b>
+• Payment ka <b>Screenshot lekar PHOTO (Image)</b> ke roop mein bhejein
+• File/Document/Videos accept nahi hote
+
+<b>Example:</b>
+1. UPI App open karein
+2. Payment history se transaction open karein
+3. <b>Screenshot</b> lein (gallery mein save hoga as IMAGE)
+4. Yaha <b>Photo</b> select karke bhejein (NOT Document)
+                    """,
+                    parse_mode="HTML"
+                )
+                return
+
     # 1. If admin sends a video/photo, show them the file_id (for setting demos)
     if is_admin(user_id):
         file_id = None
@@ -2383,6 +2487,115 @@ def handle_clear_all_payments(message):
 
     bot.reply_to(message, result_text, parse_mode="HTML")
 
+# ========== /CLEAR_PENDING_PAY COMMAND ==========
+@bot.message_handler(commands=['clear_pending_pay'])
+def handle_clear_pending_pay(message):
+    """Clear ONLY pending payments (NOT verified sales)."""
+    if not is_admin(message.from_user.id):
+        return
+
+    pending_count_before = len(pending_verifications)
+    pending_order_nums = []
+    for uid, data in pending_verifications.items():
+        onum = data.get('order_number', 'N/A')
+        pending_order_nums.append(f"#{onum}")
+
+    pending_verifications.clear()
+    save_all_data()
+
+    pending_str = ", ".join(pending_order_nums) if pending_order_nums else "None"
+    if len(pending_str) > 3000:
+        pending_str = pending_str[:3000] + " ..."
+
+    result_text = f"""
+🧹 <b>PENDING PAYMENTS CLEARED!</b>
+
+⏳ <b>Pending Removed:</b> {pending_count_before}
+🧾 <b>Order #:</b> {pending_str}
+
+✅ Only pending verifications cleared.
+✅ Verified sales records (sales_data) <b>SAFE</b> - NOT removed.
+    """
+    bot.reply_to(message, result_text, parse_mode="HTML")
+
+# ========== /CLEAR_VERIFIED COMMAND ==========
+@bot.message_handler(commands=['clear_verified'])
+def handle_clear_verified(message):
+    """Clear ONLY verified sales records (NOT pending payments)."""
+    if not is_admin(message.from_user.id):
+        return
+
+    sales_count_before = len(sales_data)
+    # Also clear all user invite_links history (verified users links) and premium flags from users_data
+    invite_cleared = 0
+    premium_flags_cleared = 0
+
+    sales_order_nums = []
+    for sale in sales_data:
+        onum = sale.get('order_number', 'N/A')
+        sales_order_nums.append(f"#{onum}")
+
+    # Clear invite_links history (these are generated on verify)
+    if isinstance(invite_links, dict):
+        invite_cleared = len(invite_links)
+        invite_links.clear()
+
+    # Clear premium flags from users_data (mark as non-premium)
+    for uid, udata in users_data.items():
+        if udata.get('is_premium'):
+            udata['is_premium'] = False
+            udata['premium_plan'] = None
+            udata['premium_until'] = None
+            udata['invite_link'] = None
+            premium_flags_cleared += 1
+
+    sales_data.clear()
+    save_all_data()
+
+    sales_str = ", ".join(sales_order_nums) if sales_order_nums else "None"
+    if len(sales_str) > 3000:
+        sales_str = sales_str[:3000] + " ..."
+
+    result_text = f"""
+🧹 <b>VERIFIED RECORDS CLEARED!</b>
+
+💰 <b>Sales Records Removed:</b> {sales_count_before}
+🧾 <b>Order #:</b> {sales_str}
+
+🔗 <b>Invite Links History Cleared:</b> {invite_cleared} users
+👤 <b>Premium Flags Reset:</b> {premium_flags_cleared} users
+
+✅ Only verified sales / links / premium flags removed.
+✅ Pending verifications <b>SAFE</b> - NOT removed.
+    """
+    bot.reply_to(message, result_text, parse_mode="HTML")
+
+# ========== /CLEAR_ORDERS COMMAND ==========
+@bot.message_handler(commands=['clear_orders'])
+def handle_clear_orders(message):
+    """Reset ONLY the order counter (total_orders) so new orders start from 1 again.
+    Does NOT touch pending or sales records."""
+    if not is_admin(message.from_user.id):
+        return
+
+    old_count = settings.get('total_orders', 0)
+    settings['total_orders'] = 0
+    save_settings()
+    save_all_data()
+
+    result_text = f"""
+🧹 <b>ORDER COUNTER RESET!</b>
+
+🔢 <b>Old Order Count:</b> {old_count}
+🔢 <b>New Order Count:</b> 0
+
+✅ Next order number will be: <b>#1</b>
+✅ Pending verifications <b>SAFE</b>
+✅ Sales records <b>SAFE</b>
+⚠️ <i>Note:</i> Existing pending/sales records still show their old order # (history preserved)
+    """
+    bot.reply_to(message, result_text, parse_mode="HTML")
+
 # ========== /SET_PROOF_CHANNEL COMMAND ==========
 @bot.message_handler(commands=['set_proof_channel'])
 def handle_set_proof_channel(message):
@@ -2464,7 +2677,10 @@ def handle_help(message):
 <b>🔹 PAYMENT VERIFICATION:</b>
 /pending     - Show ALL pending verifications (list)
 /verify [user_id] - Manually verify a pending user
-/clear_all_payments - Delete ALL pending + sales records (resets order numbers)
+/clear_all_payments - Delete EVERYTHING (pending + sales)
+/clear_pending_pay  - ❌ ONLY pending payments (sales = SAFE)
+/clear_verified     - ❌ ONLY verified sales + invite links + premium flags (pending = SAFE)
+/clear_orders       - 🔄 Reset order counter back to #1 (pending & sales SAFE)
 
 ━━━━━━━━━━━━━━━
 <b>🔹 QUICK SETTINGS (/set):</b>
