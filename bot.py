@@ -15,7 +15,7 @@ import sys
 # Import config and verification
 import config
 from config import *
-from verif import init_verification, get_random_button_color, make_colored_button
+from verif import init_verification, get_random_button_color, make_colored_button, resolve_color, color_name_display
 
 # Initialize bot
 # Use config.BOT_TOKEN to avoid NameError if star import hasn't processed it yet
@@ -55,8 +55,10 @@ def rnd_color():
     return random.choice(BUTTON_COLORS_BOT)
 
 def make_button(text, **kwargs):
-    """Create InlineKeyboardButton with random color if no url (color passed in constructor)"""
-    if 'url' not in kwargs and 'button_color' not in kwargs:
+    """Create InlineKeyboardButton with random color if no URL (color passed via button_color).
+    Compatible with Telegram Bot API's button color field: primary (blue), positive (green), negative (red).
+    """
+    if 'url' not in kwargs and 'button_color' not in kwargs and 'color' not in kwargs:
         color = rnd_color()
         if color is not None:
             kwargs['button_color'] = color
@@ -1247,8 +1249,9 @@ def handle_settings(message):
     for ch in settings.get('premium_channels', []):
         ch_id_display = ch.get('channel_id', ch.get('channel_ids', 'Not Set'))
         ch_desc = ch.get('description', '')
+        ch_color = color_name_display(ch.get('color', ''))
         desc_display = f"\n  📝 Desc: {ch_desc[:50]}{'...' if len(ch_desc) > 50 else ''}" if ch_desc else ""
-        ch_info += f"• {ch.get('id', '??')}: {ch.get('name', 'Unknown')} (₹{ch.get('amount', '0')}) - <code>{ch_id_display}</code>{desc_display}\n"
+        ch_info += f"• {ch.get('id', '??')}: {ch.get('name', 'Unknown')} (₹{ch.get('amount', '0')}) - <code>{ch_id_display}</code>\n  🎨 Color: {ch_color}{desc_display}\n"
 
     text = f"""
 <b>⚙️ CURRENT SETTINGS</b>
@@ -1257,6 +1260,7 @@ def handle_settings(message):
 <b>📢 Demo Link:</b> {settings.get('demo_channel_link', 'Not Set')}
 <b>🆔 Demo ID:</b> <code>{settings.get('demo_channel_id', 'Not Set')}</code>
 <b>💰 Demo Price:</b> ₹{settings.get('demo_amount', '10')}
+<b>🎨 Demo Button Color:</b> {color_name_display(settings.get('demo_color', ''))}
 <b>🔄 Demo Status:</b> {'PAID' if settings.get('demo_paid_status', False) else 'FREE'}
 
 <b>📋 Log Channel:</b> {settings.get('log_channel', 'Not Set')}
@@ -1661,6 +1665,31 @@ def handle_demo_price(message):
     save_settings()
     bot.reply_to(message, f"✅ Demo price set to <b>₹{amount}</b>.", parse_mode="HTML")
 
+@bot.message_handler(commands=['set_demo_color'])
+def handle_set_demo_color(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(
+            message,
+            """Usage: <code>/set_demo_color color</code>
+Available colors: <code>blue / green / red / default</code>
+Examples:
+<code>/set_demo_color green</code>
+<code>/set_demo_color default</code>""",
+            parse_mode="HTML"
+        )
+        return
+
+    color_raw = args[1]
+    resolved = resolve_color(color_raw)
+    save_value = color_raw if resolved is not None else ""
+    settings['demo_color'] = save_value
+    save_settings()
+    bot.reply_to(message, f"✅ Demo button color set to: {color_name_display(save_value)}", parse_mode="HTML")
+
 @bot.message_handler(commands=['set_demo_ch'])
 def handle_set_demo_ch(message):
     if not is_admin(message.from_user.id):
@@ -1975,38 +2004,52 @@ def handle_add_premium_ch(message):
         # Split by spaces
         args = message.text.split()
         if len(args) < 5:
-            bot.reply_to(message, "Usage: <code>/add_premium_ch id Full Name price channel_id</code>\nExample: <code>/add_premium_ch ch1 Randi Ki Dukan 99 -100xxx</code>", parse_mode="HTML")
+            bot.reply_to(message, """Usage: <code>/add_premium_ch id Full Name price channel_id [color]</code>
+Colors: <code>blue / green / red / default</code>
+Example: <code>/add_premium_ch ch1 Randi Ki Dukan 99 -100xxx green</code>""", parse_mode="HTML")
             return
-            
+
         # ID is always 2nd element
         ch_id = args[1]
-        
-        # Last two elements are always price and channel_id
-        telegram_id = args[-1]
-        price = args[-2]
-        
-        # Everything in between is the name
-        name = " ".join(args[2:-2])
-        
+
+        # Last: check if last arg is a color name, otherwise use standard parse
+        last_arg = args[-1].lower()
+        if last_arg in ('blue', 'green', 'red', 'default', 'primary', 'positive', 'negative', 'none'):
+            # has color as last arg → price/channel are args[-3] and args[-2]
+            color_raw = args[-1]
+            telegram_id = args[-2]
+            price = args[-3]
+            name = " ".join(args[2:-3])
+        else:
+            # Standard format: last two = price & channel_id, no color
+            telegram_id = args[-1]
+            price = args[-2]
+            name = " ".join(args[2:-2])
+            color_raw = ""
+
+        resolved_color = resolve_color(color_raw)
+
         if 'premium_channels' not in settings:
             settings['premium_channels'] = []
-            
+
         # Check if id already exists
         for ch in settings['premium_channels']:
             if ch['id'] == ch_id:
                 bot.reply_to(message, f"❌ ID {ch_id} already exists.")
                 return
-                
+
         settings['premium_channels'].append({
             "id": ch_id,
             "name": name,
             "amount": price,
             "channel_id": telegram_id,
             "duration": "30 Days",
-            "description": ""
+            "description": "",
+            "color": color_raw if resolved_color is not None else ""
         })
         save_settings()
-        bot.reply_to(message, f"✅ Added <b>{name}</b> (₹{price}) to membership list.", parse_mode="HTML")
+        color_info = color_name_display(color_raw if resolved_color is not None else "")
+        bot.reply_to(message, f"✅ Added <b>{name}</b> (₹{price}) to membership list.\n🎨 Button Color: {color_info}", parse_mode="HTML")
     except Exception as e:
         bot.reply_to(message, f"❌ Error: {str(e)}")
 
@@ -2042,27 +2085,45 @@ def handle_edit_premium_ch(message):
     try:
         args = message.text.split()
         if len(args) < 4:
-            bot.reply_to(message, "Usage: <code>/edit_premium_ch id key New Value</code>\nKeys: <code>name, amount, channel_id, duration</code>", parse_mode="HTML")
+            bot.reply_to(message, """Usage: <code>/edit_premium_ch id key New Value</code>
+Keys: <code>name, amount, channel_id, duration, description, color</code>
+<b>Color values:</b> <code>blue / green / red / default</code>""", parse_mode="HTML")
             return
-            
+
         ch_id = args[1]
         key = args[2].lower()
-        
+
         # Everything after key is the new value
         value = " ".join(args[3:])
-        
-        allowed_keys = ['name', 'amount', 'channel_id', 'duration', 'description']
+
+        allowed_keys = ['name', 'amount', 'channel_id', 'duration', 'description', 'color']
         if key not in allowed_keys:
             bot.reply_to(message, f"❌ Invalid key! Use: {', '.join(allowed_keys)}")
             return
-            
+
+        if key == 'color':
+            resolved = resolve_color(value)
+            save_value = value if resolved is not None else ""
+            found = False
+            for ch in settings.get('premium_channels', []):
+                if ch['id'] == ch_id:
+                    ch['color'] = save_value
+                    found = True
+                    break
+            if found:
+                save_settings()
+                bot.reply_to(message, f"✅ Updated <b>color</b> for <b>{ch_id}</b> to: {color_name_display(save_value)}", parse_mode="HTML")
+            else:
+                bot.reply_to(message, f"❌ Channel ID {ch_id} not found.")
+            return
+
         found = False
         for ch in settings.get('premium_channels', []):
             if ch['id'] == ch_id:
                 ch[key] = value
                 found = True
                 break
-                    
+
         if found:
             save_settings()
             bot.reply_to(message, f"✅ Updated <b>{key}</b> for <b>{ch_id}</b> to: <code>{value}</code>", parse_mode="HTML")
@@ -2816,6 +2877,7 @@ Use: <code>/set [key] [value]</code>
 <b>🔹 DEMO CHANNEL SETTINGS:</b>
 /demo_toggle        - Toggle demo between FREE/PAID
 /demo_price [amt]   - Set demo price (e.g. /demo_price 10)
+/set_demo_color [color] - 🎨 Demo button color: blue / green / red / default
 /set_demo_ch [id]   - Set demo channel ID (for invite link)
 /set_demo_link [url] - Set demo channel link (direct URL)
 
@@ -2832,16 +2894,28 @@ Use: <code>/set [key] [value]</code>
 
 ━━━━━━━━━━━━━━━
 <b>🔹 PREMIUM CHANNEL MANAGEMENT:</b>
-/add_premium_ch [id] [Full Name] [price] [channel_id]
-    → Add new premium channel
-    → <b>Example:</b> <code>/add_premium_ch ch8 Pro Movies 199 -1001234567890</code>
+/add_premium_ch [id] [Full Name] [price] [channel_id] [color]
+    → Add new premium channel (optional color at END)
+    → <b>Colors:</b> <code>blue / green / red / default</code>
+    → <b>Example:</b> <code>/add_premium_ch ch8 Pro Movies 199 -1001234567890 green</code>
 
 /remove_premium_ch [id]
     → Remove a channel (e.g. /remove_premium_ch ch8)
 
 /edit_premium_ch [id] [key] [New Value]
-    → <b>Keys:</b> name, amount, channel_id, duration, description
+    → <b>Keys:</b> name, amount, channel_id, duration, description, <b>color</b>
+    → <b>Example:</b> <code>/edit_premium_ch ch1 color green</code>
     → <b>Example:</b> <code>/edit_premium_ch ch1 amount 149</code>
+
+🎨 <b>BUTTON COLOR SYSTEM:</b>
+Telegram officially supports 3 colors + default:
+  🟢 <b>green / positive</b>  → Success-style buttons
+  🔵 <b>blue / primary</b>    → Standard colored buttons
+  🔴 <b>red / negative</b>   → Warning/danger buttons
+  ⚪ <b>default / none</b>   → Default white (bot will pick random color)
+
+💡 <b>Random Colors:</b>
+All other buttons (Buy Now, Back, Payment Done, etc.) automatically get random colors (blue/green/red/default) every time they are rendered.
 
 /set_price single [amt]  - Legacy single channel price
 /set_price all [amt]     - Legacy all channels price
