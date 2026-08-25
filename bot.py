@@ -785,29 +785,24 @@ Jab tak admin purane payment ko verify/reject nahi kar dete, aap naya payment cr
 
 ⏳ <i>Please wait for admin verification...</i>
             """
+            try:
+                bot.delete_message(chat_id, msg_id)
+            except:
+                pass
+            if msg_id in user_all_messages.get(str(chat_id), []):
+                user_all_messages[str(chat_id)].remove(msg_id)
+
+            m = bot.send_message(chat_id, msg, parse_mode="HTML")
+            track_msg(chat_id, m.message_id)
+            bot.answer_callback_query(call.id)
+            return
         else:
-            msg = f"""
-⛔ <b>PAYMENT PENDING!</b>
-
-Aapka Order #{order_num} pehle se hi pending hai.
-Jab tak is payment ko verify/reject nahi kar dete, aap naya payment create nahi kar sakte.
-
-<b>To aage badhne ke liye:</b>
-✅ Payment complete karke screenshot upload karein
-⏳ Ya phir admin se purane payment ko cancel karne ke liye contact karein
-            """
-
-        try:
-            bot.delete_message(chat_id, msg_id)
-        except:
-            pass
-        if msg_id in user_all_messages.get(str(chat_id), []):
-            user_all_messages[str(chat_id)].remove(msg_id)
-
-        m = bot.send_message(chat_id, msg, parse_mode="HTML")
-        track_msg(chat_id, m.message_id)
-        bot.answer_callback_query(call.id)
-        return
+            del pending_verifications[str(user_id)]
+            bot.answer_callback_query(
+                call.id,
+                "✅ Purani pending payment cancel ho gayi. Naya QR generate ho raha hai...",
+                show_alert=False
+            )
 
     plan = None
     if plan_type in config.PLANS:
@@ -847,6 +842,9 @@ Jab tak is payment ko verify/reject nahi kar dete, aap naya payment create nahi 
 1. Scan QR with any UPI app
 2. Pay ₹{plan['amount']}
 3. Click "✅ Payment Done" below
+
+⚠️ <b>IMPORTANT NOTE:</b> ❌ <b>DO NOT USE GPAY</b> for payment.
+Please use any other UPI app (PhonePe, Paytm, BHIM, etc.) for payment.
 
 ⏳ <i>This QR will auto-delete in 10 minutes.</i>
     """
@@ -1135,6 +1133,108 @@ def handle_manual_verify(message):
     
     success, msg = verif.verify_payment(user_id, message.from_user.id)
     bot.reply_to(message, msg)
+
+# ========== /CANCEL_ORDER COMMAND ==========
+@bot.message_handler(commands=['cancel_order'])
+def handle_cancel_order(message):
+    user_id = message.from_user.id
+    user_id_str = str(user_id)
+
+    if user_id_str not in pending_verifications:
+        bot.reply_to(
+            message,
+            "✅ <b>No Pending Order Found!</b>\n\nAapka koi pending order nahi hai. Order cancel karne ke liye pehle ek order create karo.",
+            parse_mode="HTML"
+        )
+        return
+
+    pending_data = pending_verifications[user_id_str]
+    order_num = pending_data.get('order_number', 'N/A')
+    screenshot_uploaded = pending_data.get('screenshot_file_id', False)
+    plan_type = pending_data.get('plan', 'N/A')
+    amount = pending_data.get('amount', 'N/A')
+
+    if screenshot_uploaded:
+        try:
+            admin_notify_msg = f"""
+🚨 <b>USER CANCELLED PENDING ORDER</b>
+
+👤 Name: {pending_data.get('first_name', 'N/A')}
+👤 User: @{pending_data.get('username', 'N/A')}
+🆔 ID: <code>{user_id}</code>
+🧾 Order #: {order_num}
+📅 Plan: {plan_type}
+💰 Amount: ₹{amount}
+⏰ Cancelled At: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+⚠️ <b>Note:</b> User ne screenshot upload kar diya tha but ab cancel kar raha hai.
+Agar payment already receive ho gaya hai to manually user se contact karein.
+            """
+
+            target_chat = settings.get('log_channel')
+            sent_to_admin = False
+            try:
+                if target_chat:
+                    bot.send_message(target_chat, admin_notify_msg, parse_mode="HTML")
+                    sent_to_admin = True
+            except Exception as e:
+                logging.warning(f"Cancel notify log channel error: {e}")
+
+            if not sent_to_admin:
+                for aid in settings.get('admin_ids', []):
+                    try:
+                        bot.send_message(aid, admin_notify_msg, parse_mode="HTML")
+                        break
+                    except:
+                        continue
+
+            admin_chat_id = pending_data.get('admin_chat_id')
+            admin_msg_id = pending_data.get('admin_msg_id')
+            if admin_chat_id and admin_msg_id:
+                try:
+                    bot.send_message(
+                        admin_chat_id,
+                        f"🚫 <b>ORDER #{order_num} CANCELLED BY USER</b>\n\nPlease ignore the above pending screenshot for User ID: <code>{user_id}</code>",
+                        parse_mode="HTML",
+                        reply_to_message_id=admin_msg_id
+                    )
+                except:
+                    try:
+                        bot.send_message(
+                            admin_chat_id,
+                            f"🚫 <b>ORDER #{order_num} CANCELLED BY USER</b>\nUser ID: <code>{user_id}</code>. Please ignore earlier pending screenshot.",
+                            parse_mode="HTML"
+                        )
+                    except:
+                        pass
+        except Exception as e:
+            logging.error(f"Cancel order admin notify error: {e}")
+
+    del pending_verifications[user_id_str]
+    save_json_file(PENDING_VERIF_FILE, pending_verifications)
+
+    if screenshot_uploaded:
+        user_msg = f"""
+✅ <b>ORDER #{order_num} CANCELLED!</b>
+
+💰 Amount: ₹{amount}
+📅 Plan: {plan_type}
+
+📢 <b>Important:</b> Aapne payment screenshot upload kar diya tha.
+Agar aapne actual mein payment kar diya hai to please admin se contact karein.
+Agar payment nahi kiya hai to koi action nahi lena hai - naya order /start se create kar sakte ho.
+        """
+    else:
+        user_msg = f"""
+✅ <b>ORDER #{order_num} CANCELLED!</b>
+
+💰 Amount: ₹{amount}
+📅 Plan: {plan_type}
+
+Order successfully cancel ho gaya. Naya order create karne ke liye /start use karein.
+        """
+
+    bot.reply_to(message, user_msg, parse_mode="HTML")
 
 # ========== /SETTINGS COMMAND (FIXED HTML) ==========
 @bot.message_handler(commands=['settings'])
@@ -2632,8 +2732,9 @@ def handle_help(message):
 
 ━━━━━━━━━━━━━━━
 <b>🔹 BASIC COMMANDS:</b>
-/start  - Start the bot / Show Main Menu
-/help   - Show this complete help message
+/start         - Start the bot / Show Main Menu
+/help          - Show this complete help message
+/cancel_order  - ❌ Cancel your pending payment order (anytime)
 
 ━━━━━━━━━━━━━━━
 <b>🔹 QUICK LINKS:</b>
@@ -2645,13 +2746,21 @@ def handle_help(message):
 <b>🔹 HOW TO BUY PREMIUM:</b>
 1. Send <code>/start</code> → Click any <b>💎 Premium Channel</b> button
 2. Click <b>💳 Buy Now</b> → Scan QR / Pay via UPI
-3. Send <b>payment screenshot</b> as photo
+   ⚠️ <b>NOTE:</b> ❌ DO NOT USE GPAY. Use PhonePe / Paytm / BHIM
+3. Click <b>✅ Payment Done</b> → Send <b>payment screenshot</b> as PHOTO
 4. Admin will verify & send unique join link
+
+━━━━━━━━━━━━━━━
+<b>🔹 HOW TO CANCEL ORDER:</b>
+• Agar payment nahi kiya: <code>/cancel_order</code> → Order cancel
+• Agar payment + screenshot kar diya: <code>/cancel_order</code> → Order cancel + admin ko alert
+• Agar payment kar diya but screenshot nahi bheja: <code>/cancel_order</code> → Seedha cancel
+• After cancel: <code>/start</code> se naya order bana sakte ho
 
 ━━━━━━━━━━━━━━━
 <b>💡 TIPS:</b>
 • Use Main Menu buttons for quick access
-• If you have pending payment, wait for admin verification
+• If pending = screenshot uploaded → wait for admin OR use /cancel_order
 • For any issue click <b>📞 Contact Support</b> button
         """
         # Split if too long
@@ -2682,6 +2791,10 @@ def handle_help(message):
 /clear_verified     - ❌ ONLY verified sales + invite links + premium flags (pending = SAFE)
 /clear_orders       - 🔄 Reset order counter back to #1 (pending & sales SAFE)
 
+💡 <b>USER CANCEL:</b> Users can cancel their own pending order anytime with <code>/cancel_order</code>
+   • If screenshot uploaded → Admin gets alert + ignore-tag on your pending message
+   • If no screenshot → Silent cancel (no admin alert needed)
+
 ━━━━━━━━━━━━━━━
 <b>🔹 QUICK SETTINGS (/set):</b>
 Use: <code>/set [key] [value]</code>
@@ -2710,7 +2823,7 @@ Use: <code>/set [key] [value]</code>
 <b>🔹 PAYMENT PROOF SETTINGS:</b>
 /proof_toggle        - Toggle 🧾 Payment Proofs button ON/OFF
 /set_proof_link [url] - Set payment proof channel link
-/set_proof_channel [id] - Set proof channel ID (auto-post verified proofs)
+/set_proof_channel [id] - Set proof channel ID (auto-post verified proofs there)
 
 ━━━━━━━━━━━━━━━
 <b>🔹 CONTACT SUPPORT SETTINGS:</b>
