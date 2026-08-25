@@ -153,6 +153,7 @@ DEFAULT_SETTINGS = {
     "demo_channel_id": "",
     "demo_paid_status": False,
     "demo_amount": "10",
+    "demo_color": "",
     "payment_proof_link": "",
     "payment_proof_status": True,
     "support_username": "",
@@ -164,14 +165,14 @@ DEFAULT_SETTINGS = {
     "start_demo_desc": "",
     "plan_demo_descs": {},
     "premium_channels": [
-        {"id": "ch1", "name": "Channel 1", "amount": "99", "channel_id": "", "duration": "30 Days", "description": ""},
-        {"id": "ch2", "name": "Channel 2", "amount": "99", "channel_id": "", "duration": "30 Days", "description": ""},
-        {"id": "ch3", "name": "Channel 3", "amount": "99", "channel_id": "", "duration": "30 Days", "description": ""},
-        {"id": "ch4", "name": "Channel 4", "amount": "99", "channel_id": "", "duration": "30 Days", "description": ""},
-        {"id": "ch5", "name": "Channel 5", "amount": "99", "channel_id": "", "duration": "30 Days", "description": ""},
-        {"id": "ch6", "name": "Channel 6", "amount": "99", "channel_id": "", "duration": "30 Days", "description": ""},
-        {"id": "ch7", "name": "Channel 7", "amount": "99", "channel_id": "", "duration": "30 Days", "description": ""},
-        {"id": "all", "name": "All Channels", "amount": "299", "channel_ids": [], "duration": "30 Days", "description": ""}
+        {"id": "ch1", "name": "Channel 1", "amount": "99", "channel_id": "", "duration": "30 Days", "description": "", "color": ""},
+        {"id": "ch2", "name": "Channel 2", "amount": "99", "channel_id": "", "duration": "30 Days", "description": "", "color": ""},
+        {"id": "ch3", "name": "Channel 3", "amount": "99", "channel_id": "", "duration": "30 Days", "description": "", "color": ""},
+        {"id": "ch4", "name": "Channel 4", "amount": "99", "channel_id": "", "duration": "30 Days", "description": "", "color": ""},
+        {"id": "ch5", "name": "Channel 5", "amount": "99", "channel_id": "", "duration": "30 Days", "description": "", "color": ""},
+        {"id": "ch6", "name": "Channel 6", "amount": "99", "channel_id": "", "duration": "30 Days", "description": "", "color": ""},
+        {"id": "ch7", "name": "Channel 7", "amount": "99", "channel_id": "", "duration": "30 Days", "description": "", "color": ""},
+        {"id": "all", "name": "All Channels", "amount": "299", "channel_ids": [], "duration": "30 Days", "description": "", "color": ""}
     ]
 }
 
@@ -254,6 +255,8 @@ if 'premium_channels' not in settings:
 for ch in settings.get('premium_channels', []):
     if 'description' not in ch:
         ch['description'] = ""
+    if 'color' not in ch:
+        ch['color'] = ""
 save_json_file(SETTINGS_FILE, settings)
 
 # Migration: Ensure proof_channel_id exists
