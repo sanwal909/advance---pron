@@ -27,24 +27,60 @@ def _patched_ikb_to_dict_verif(self):
 types.InlineKeyboardButton.to_dict = _patched_ikb_to_dict_verif
 
 BUTTON_COLORS = [None, "primary", "positive", "negative"]
+BUTTON_COLORS_NO_NONE = ["primary", "positive", "negative"]
+BUTTON_COLORS_CHOICE = {
+    "blue": "primary",
+    "green": "positive",
+    "red": "negative",
+    "primary": "primary",
+    "positive": "positive",
+    "negative": "negative",
+    "default": None,
+    "none": None,
+    "": None,
+}
 
 def get_random_button_color():
-    """Return a random button color for Telegram's colored buttons:
-    None = default (white/light)
-    primary = blue
-    positive = green
-    negative = red
-    """
     return random.choice(BUTTON_COLORS)
 
+def get_random_button_color_nondefault():
+    return random.choice(BUTTON_COLORS_NO_NONE)
+
+def resolve_color(color_val):
+    if not color_val:
+        return None
+    if color_val in BUTTON_COLORS:
+        return color_val
+    return BUTTON_COLORS_CHOICE.get(str(color_val).lower(), None)
+
+def color_name_display(color_val):
+    c = resolve_color(color_val)
+    if c is None:
+        return "Default (White)"
+    if c == "primary":
+        return "🔵 Blue (primary)"
+    if c == "positive":
+        return "🟢 Green (positive)"
+    if c == "negative":
+        return "🔴 Red (negative)"
+    return str(color_val)
+
 def make_colored_button(text, **kwargs):
-    """Create InlineKeyboardButton with random color (passed in constructor for proper serialization).
-    Only callback buttons get color (not URL buttons).
-    """
-    if 'url' not in kwargs:
+    if 'url' not in kwargs and 'button_color' not in kwargs and 'color' not in kwargs:
         color = get_random_button_color()
         if color is not None:
             kwargs['button_color'] = color
+    return types.InlineKeyboardButton(text, **kwargs)
+
+def make_channel_button(text, channel_color, **kwargs):
+    if 'url' in kwargs:
+        return types.InlineKeyboardButton(text, **kwargs)
+    if 'button_color' in kwargs or 'color' in kwargs:
+        return types.InlineKeyboardButton(text, **kwargs)
+    resolved = resolve_color(channel_color)
+    if resolved is None:
+        resolved = get_random_button_color_nondefault()
+    kwargs['button_color'] = resolved
     return types.InlineKeyboardButton(text, **kwargs)
 
 class VerificationSystem:
@@ -145,13 +181,14 @@ class VerificationSystem:
             return f"Error creating link: {str(e)}"
 
     def plan_selection_keyboard(self):
-        """Dynamic Membership keyboard with random button colors"""
+        """Dynamic Membership keyboard with channel-specific or random button colors"""
         keyboard = types.InlineKeyboardMarkup(row_width=1)
-        
+
         channels = settings.get("premium_channels", [])
         for ch in channels:
-            btn = make_colored_button(
+            btn = make_channel_button(
                 f"🔗 {ch['name']} - ₹{ch['amount']}",
+                ch.get('color', ''),
                 callback_data=f"plan_{ch['id']}"
             )
             keyboard.add(btn)
@@ -161,7 +198,7 @@ class VerificationSystem:
         return keyboard
 
     def main_menu_keyboard(self):
-        """Main menu with premium channels shown directly + random button colors + Contact Support"""
+        """Main menu with premium channels shown directly + channel-based colors + Contact Support"""
         keyboard = types.InlineKeyboardMarkup(row_width=1)
 
         # 1. Free Video Channel
@@ -170,7 +207,8 @@ class VerificationSystem:
         demo_link = settings.get('demo_channel_link', '')
 
         if is_paid:
-            btn = make_colored_button(f"📢 Free Video Channel (₹{demo_amount})", callback_data="plan_demo")
+            demo_color = settings.get('demo_color', '') or ''
+            btn = make_channel_button(f"📢 Free Video Channel (₹{demo_amount})", demo_color, callback_data="plan_demo")
             keyboard.add(btn)
         elif demo_link:
             btn = types.InlineKeyboardButton("📢 Free Video Channel", url=demo_link)
@@ -182,8 +220,9 @@ class VerificationSystem:
         # 2. Premium Channels (Directly shown)
         channels = settings.get("premium_channels", [])
         for ch in channels:
-            btn = make_colored_button(
+            btn = make_channel_button(
                 f"💎 {ch['name']} - ₹{ch['amount']}",
+                ch.get('color', ''),
                 callback_data=f"plan_{ch['id']}"
             )
             keyboard.add(btn)
