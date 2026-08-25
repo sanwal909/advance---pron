@@ -2077,6 +2077,156 @@ def handle_remove_premium_ch(message):
     else:
         bot.reply_to(message, f"❌ Channel ID {ch_id} not found.")
 
+@bot.message_handler(commands=['list_ch'])
+def handle_list_ch(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    channels = settings.get('premium_channels', [])
+    if not channels:
+        bot.reply_to(message, "❌ No premium channels added yet. Use /add_premium_ch first.")
+        return
+
+    lines = ["<b>📋 PREMIUM CHANNELS (Current Order)</b>\n"]
+    lines.append("<code>Pos  ID       Name                       Price  Color</code>")
+    lines.append("<code>──── ──────── ────────────────────────── ───── ─────────────</code>")
+    for idx, ch in enumerate(channels, 1):
+        ch_id = str(ch.get('id', '??'))[:8].ljust(8)
+        name = (ch.get('name', 'Unknown') or 'Unknown')[:26].ljust(26)
+        price = "₹" + str(ch.get('amount', '0'))
+        color = color_name_display(ch.get('color', ''))
+        lines.append(f"<code>{idx:>3}.  {ch_id} {name} {price:>5}</code>  {color}")
+
+    lines.append(f"\n<b>Total:</b> {len(channels)} channels")
+    lines.append("\n<i>Order change karne ke liye use karein:</i>")
+    lines.append("  <code>/reorder_ch ch_id NEW_POSITION</code>")
+    lines.append("  <code>/swap_ch ch_id1 ch_id2</code>")
+    bot.reply_to(message, "\n".join(lines), parse_mode="HTML")
+
+@bot.message_handler(commands=['reorder_ch'])
+def handle_reorder_ch(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    args = message.text.split()
+    if len(args) < 3:
+        bot.reply_to(
+            message,
+            """Usage: <code>/reorder_ch channel_id NEW_POSITION</code>
+
+<b>Example:</b>
+  <code>/list_ch</code>                          → Pehle current order dekh lo
+  <code>/reorder_ch ch1 5</code>                → ch1 ko 5th position par le jaao
+  <code>/reorder_ch ch5 2</code>                → ch5 ko 2nd position par le jaao
+
+<b>Note:</b> Positions <code>1</code> se start hoti hai. Last position = total channels.""",
+            parse_mode="HTML"
+        )
+        return
+
+    ch_id = args[1]
+    try:
+        new_pos = int(args[2])
+    except ValueError:
+        bot.reply_to(message, "❌ Position must be a number (1, 2, 3, ...).")
+        return
+
+    channels = settings.get('premium_channels', [])
+    total = len(channels)
+
+    if new_pos < 1 or new_pos > total:
+        bot.reply_to(message, f"❌ Invalid position! Total channels = {total}. Use 1 to {total}.")
+        return
+
+    old_idx = None
+    moving_ch = None
+    for i, ch in enumerate(channels):
+        if ch.get('id') == ch_id:
+            old_idx = i
+            moving_ch = ch
+            break
+
+    if old_idx is None or moving_ch is None:
+        bot.reply_to(message, f"❌ Channel ID '{ch_id}' not found. Use /list_ch to see IDs.")
+        return
+
+    old_pos = old_idx + 1
+    if old_pos == new_pos:
+        bot.reply_to(message, f"ℹ️ Channel {ch_id} already at position {new_pos}. No change.")
+        return
+
+    channels.pop(old_idx)
+    channels.insert(new_pos - 1, moving_ch)
+    settings['premium_channels'] = channels
+    save_settings()
+
+    bot.reply_to(
+        message,
+        f"✅ <b>Order Updated!</b>\n\n"
+        f"📦 <b>{moving_ch.get('name', ch_id)}</b> (<code>{ch_id}</code>)\n"
+        f"   Old Position: #{old_pos}\n"
+        f"   New Position: #{new_pos}\n\n"
+        f"Verify with: <code>/list_ch</code>",
+        parse_mode="HTML"
+    )
+
+@bot.message_handler(commands=['swap_ch'])
+def handle_swap_ch(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    args = message.text.split()
+    if len(args) < 3:
+        bot.reply_to(
+            message,
+            """Usage: <code>/swap_ch channel_id1 channel_id2</code>
+
+Do channels ki position aapas mein swap/swap kar dega.
+
+<b>Example:</b>
+  <code>/list_ch</code>             → Pehle current order dekh lo
+  <code>/swap_ch ch1 ch5</code>     → ch1 aur ch5 ki positions swap ho jaayengi""",
+            parse_mode="HTML"
+        )
+        return
+
+    ch_id1 = args[1]
+    ch_id2 = args[2]
+
+    if ch_id1 == ch_id2:
+        bot.reply_to(message, "❌ Both channel IDs are same. Nothing to swap.")
+        return
+
+    channels = settings.get('premium_channels', [])
+    idx1 = None
+    idx2 = None
+    for i, ch in enumerate(channels):
+        if ch.get('id') == ch_id1:
+            idx1 = i
+        if ch.get('id') == ch_id2:
+            idx2 = i
+
+    if idx1 is None:
+        bot.reply_to(message, f"❌ Channel ID '{ch_id1}' not found.")
+        return
+    if idx2 is None:
+        bot.reply_to(message, f"❌ Channel ID '{ch_id2}' not found.")
+        return
+
+    ch1 = channels[idx1]
+    ch2 = channels[idx2]
+    channels[idx1], channels[idx2] = channels[idx2], channels[idx1]
+    settings['premium_channels'] = channels
+    save_settings()
+
+    bot.reply_to(
+        message,
+        f"✅ <b>Channels Swapped!</b>\n\n"
+        f"🔀 <b>{ch1.get('name', ch_id1)}</b> (<code>{ch_id1}</code>) ↔️  <b>{ch2.get('name', ch_id2)}</b> (<code>{ch_id2}</code>)\n\n"
+        f"Verify with: <code>/list_ch</code>",
+        parse_mode="HTML"
+    )
+
 @bot.message_handler(commands=['edit_premium_ch'])
 def handle_edit_premium_ch(message):
     if not is_admin(message.from_user.id):
@@ -2906,6 +3056,18 @@ Use: <code>/set [key] [value]</code>
     → <b>Keys:</b> name, amount, channel_id, duration, description, <b>color</b>
     → <b>Example:</b> <code>/edit_premium_ch ch1 color green</code>
     → <b>Example:</b> <code>/edit_premium_ch ch1 amount 149</code>
+
+/list_ch  - 📋 Show ALL channels in current order (with position numbers + color)
+
+/reorder_ch [id] [NEW_POSITION]  - 🔄 Move a channel to exact position
+    → Positions start at 1. Last position = total channels
+    → <b>Example (your case):</b>
+      <code>/list_ch</code>                     → Pehle current order dekh lo
+      <code>/reorder_ch ch1 5</code>           → 1st wale ko 5th position par
+      <code>/reorder_ch ch5 2</code>           → 5th wale ko 2nd position par
+
+/swap_ch [id1] [id2]  - 🔀 Swap positions of 2 channels
+    → <b>Example:</b> <code>/swap_ch ch1 ch5</code>  → ch1 ↔ ch5 (direct swap)
 
 🎨 <b>BUTTON COLOR SYSTEM:</b>
 Telegram officially supports 3 colors + default:
