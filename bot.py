@@ -17,16 +17,98 @@ import config
 from config import *
 from verif import init_verification, get_random_button_color, make_colored_button, resolve_color, color_name_display
 
-# Initialize bot
-# Use config.BOT_TOKEN to avoid NameError if star import hasn't processed it yet
+# Initialize bot — SAFE TOKEN VALIDATION & VERIFICATION
+# Priority: env var via config.BOT_TOKEN (loaded from .env)
 _token = getattr(config, 'BOT_TOKEN', os.getenv("BOT_TOKEN", ""))
+_token = _token.strip().strip('"').strip("'")
 
-if not _token or ":" not in _token:
-    print("\n❌ ERROR: BOT_TOKEN is missing or invalid in .env file!")
-    print("Please make sure you have created a .env file with BOT_TOKEN=your_token_here")
+# ---------- Step 1: Format-level check (cheap, local) ----------
+if not _token:
+    print("\n❌ FATAL: BOT_TOKEN environment variable is EMPTY!")
+    print("How to fix:")
+    print("  1. Go to @BotFather on Telegram")
+    print("  2. Create a new bot (or use an existing one) and copy the HTTP API token")
+    print("  3. In your hosting panel, set env variable BOT_TOKEN=<your-new-token>")
+    print("  4. Restart the bot / redeploy")
     sys.exit(1)
 
-bot = telebot.TeleBot(_token, parse_mode="HTML")
+# Telegram bot tokens always look like NNNNNNNN:AAAAAAAAAAAAAAAAAAAAAAAAAAA
+# Format check: digits + ":" + base64-like chars (no whitespace)
+import re as _re
+_token_fmt_ok = bool(_re.fullmatch(r"\d{6,12}:[A-Za-z0-9_\-]{20,60}", _token))
+if not _token_fmt_ok:
+    print("\n❌ FATAL: BOT_TOKEN format looks INVALID!")
+    print("Expected format: 1234567890:ABCdefGHIjklMNOpqrSTUvwxYZ_123")
+    print("Please double-check the token value from @BotFather.")
+    print("Token starts with:", _token[:6], "..." if len(_token) > 6 else "")
+    sys.exit(1)
+
+# ---------- Step 2: Create TeleBot instance ----------
+bot = telebot.TeleBot(_token, parse_mode="HTML", threaded=True)
+
+# ---------- Step 3: REAL Telegram API validation via get_me() ----------
+_bot_me = None
+_bot_token_retry = 3
+_bot_token_retry_wait = 2
+for _attempt in range(1, _bot_token_retry + 1):
+    try:
+        _bot_me = bot.get_me()
+        if _bot_me and getattr(_bot_me, 'id', None):
+            break
+    except telebot.apihelper.ApiTelegramException as _e:
+        _err_desc = getattr(_e, 'description', str(_e))
+        _err_code = getattr(_e, 'error_code', 0)
+        # 401 = Unauthorized (token invalid / revoked)
+        # 404 = Not Found (malformed token)
+        if _err_code in (401, 404):
+            print(f"\n❌ FATAL: BOT_TOKEN rejected by Telegram (HTTP {_err_code})!")
+            print(f"Message: {_err_desc}")
+            print("\nPossible causes:")
+            print("  • Token is wrong / has typos")
+            print("  • Old bot was banned/deleted — you need a NEW token from @BotFather")
+            print("  • Token has been revoked")
+            print("\nFix:")
+            print("  1. Open @BotFather → /mybots → your bot → API Token → 'Revoke current token' → Generate new")
+            print("  2. Replace BOT_TOKEN env var with the new token")
+            print("  3. Restart the bot")
+            sys.exit(1)
+        else:
+            print(f"⚠️ Telegram get_me attempt {_attempt}/{_bot_token_retry} failed: HTTP {_err_code} {_err_desc}")
+            if _attempt < _bot_token_retry:
+                time.sleep(_bot_token_retry_wait)
+    except Exception as _e:
+        print(f"⚠️ Token validation network error attempt {_attempt}/{_bot_token_retry}: {type(_e).__name__}")
+        if _attempt < _bot_token_retry:
+            time.sleep(_bot_token_retry_wait)
+else:
+    # For-loop exhausted without break AND token was not known-invalid → transient network issue
+    # Don't crash — polling itself is where updates come from, and infinity_polling has its own
+    # retries. But warn clearly.
+    print("\n⚠️ WARNING: Could not reach Telegram API to validate the token RIGHT NOW.")
+    print("  (Likely temporary network / DNS issue.)")
+    print("  Bot will still start and retry polling. If token is bad, polling will keep failing.")
+    _bot_me = None
+
+# ---------- Step 4: Mark valid and cache bot identity info (never persist with data) ----------
+config.startup_status["bot_token_valid"] = _bot_me is not None and getattr(_bot_me, 'id', None) is not None
+
+# Identity info cached for logs only — NOT saved to DB
+if _bot_me:
+    _bot_id = getattr(_bot_me, 'id', None)
+    _bot_username = getattr(_bot_me, 'username', None)
+    _bot_name = getattr(_bot_me, 'first_name', None)
+    print(f"✅ Telegram token verified. Bot ID: {_bot_id}  Username: @{_bot_username}  Name: {_bot_name}")
+    logging.info(f"Bot identity verified: id={_bot_id} username=@{_bot_username}")
+else:
+    print("ℹ️ Telegram token NOT verified at startup (network). Will retry during polling.")
+    logging.warning("Bot token NOT verified with Telegram API yet (startup network issue).")
+    _bot_id = None
+    _bot_username = None
+    _bot_name = None
+
+del _token_fmt_ok, _re, _attempt, _bot_token_retry, _bot_token_retry_wait
+# NOTE: Keep `_token` local to the module; the `bot` instance is the handle.
+# We intentionally do NOT log/print the actual token anywhere.
 
 # ========== BUTTON COLOR FIX (to_dict patch for Telegram Bot API Mini Apps colors) ==========
 # pyTelegramBotAPI doesn't include button_color in to_dict() by default
@@ -157,23 +239,53 @@ _pending_cleanup_thread = threading.Thread(target=auto_clean_pending_payments, d
 _pending_cleanup_thread.start()
 logging.info("🧹 Auto-clean pending payments thread started (10min timeout, no user msg).")
 
-# Notify Admin about MongoDB status on startup
+# Notify Admin about MongoDB status on startup (SAFE: never include Mongo URI in messages)
 def notify_mongo_status():
     try:
-        if config.mongo_error:
+        if not config.startup_status["mongo_connected"] and config.startup_status.get("mongo_error"):
+            # Wait a bit for bot polling to be online so send_message succeeds
+            time.sleep(5)
             admin_ids = settings.get('admin_ids', [])
             if admin_ids:
-                msg = f"⚠️ <b>MongoDB Connection Failed!</b>\n\nError: <code>{config.mongo_error}</code>\n\n💡 Bot is running on <b>Local JSON</b> mode. Your data will be saved locally in the <code>data/</code> folder."
+                raw_err = config.startup_status["mongo_error"] or config.mongo_error or "unknown"
+                safe_err = config.redact_secrets_from_text(str(raw_err), max_len=300)
+                msg = (
+                    f"⚠️ <b>MongoDB Connection Failed!</b>\n\n"
+                    f"<b>Error type:</b> <code>{safe_err}</code>\n\n"
+                    f"💡 Bot is running on <b>Local JSON</b> mode. "
+                    f"Your data will be saved locally in the <code>data/</code> folder.\n\n"
+                    f"🔧 <b>How to fix:</b>\n"
+                    f"1. Check MONGO_URI env var in your hosting panel\n"
+                    f"2. Verify network / firewall allows outbound to MongoDB\n"
+                    f"3. Restart / redeploy the bot\n\n"
+                    f"ℹ️ <b>Note:</b> If the old bot was replaced with a new bot token, "
+                    f"existing DB data (admins, users, settings) are AUTOMATICALLY restored "
+                    f"once MongoDB reconnects."
+                )
                 for aid in admin_ids:
                     try:
                         bot.send_message(aid, msg, parse_mode="HTML")
-                    except:
+                    except Exception as _ee:
+                        logging.warning(f"notify_mongo_status: failed to send admin {aid}: {type(_ee).__name__}")
                         continue
     except Exception as e:
-        logging.error(f"Notify Mongo Status Error: {e}")
+        logging.error(f"Notify Mongo Status Error: {type(e).__name__}")
 
 # Run notification in a separate thread to not block startup
 threading.Thread(target=notify_mongo_status, daemon=True).start()
+
+# ---------- Token-change admin advisory (safe, informational only) ----------
+def _notify_bot_identity_if_changed():
+    """If bot identity info is available at startup, log a one-line summary (never DM) for debugging.
+    We intentionally do NOT DM admins the bot username — that would cause message spam on every restart."""
+    try:
+        if '_bot_username' in dir() and _bot_username:
+            logging.info(f"Startup: bot identity is @{_bot_username} (id={_bot_id}). "
+                         f"DB data source: {'MongoDB' if config.startup_status['config_loaded_from_mongo'] else 'local JSON'}.")
+    except Exception:
+        pass
+
+threading.Thread(target=_notify_bot_identity_if_changed, daemon=True).start()
 
 user_demo_messages = {}
 user_all_messages = {}
@@ -3164,31 +3276,143 @@ def handle_all_messages(message):
     # logging.debug(f"Received message: {message.text} from {message.from_user.id}")
     pass
 
+# ========== POLLING HELPERS (conflict detection, recovery) ==========
+_polling_started = False
+_polling_lock = threading.Lock()
+
+def safe_start_polling():
+    """Start telegram polling safely — prevents duplicate polling processes in this process,
+    handles 'Conflict: terminated by other getUpdates request' (HTTP 409) with backoff,
+    and never swallows unrecoverable errors silently."""
+    global _polling_started
+    with _polling_lock:
+        if _polling_started:
+            logging.warning("safe_start_polling: polling already started in this process; ignoring duplicate call.")
+            return
+        _polling_started = True
+
+    _ALLOWED_UPDATES = ["message", "callback_query", "chat_member", "chat_join_request"]
+    backoff = 1  # seconds
+    max_backoff = 32
+    restart_count = 0
+    MAX_RESTARTS = 100  # effectively infinite, but bounded
+
+    config.startup_status["bot_initialized"] = True
+
+    while restart_count < MAX_RESTARTS:
+        try:
+            print("🚀 Starting Telegram long-polling...")
+            logging.info("Telegram polling: starting infinity_polling (foreground).")
+            # infinity_polling already does retries; but we wrap to handle
+            # specific HTTP 409 (conflict) and other unexpected exits.
+            bot.infinity_polling(
+                timeout=60,
+                long_polling_timeout=60,
+                allowed_updates=_ALLOWED_UPDATES,
+                restart_on_change=False,  # we control restarts explicitly below
+            )
+            # If we reach here, infinity_polling returned cleanly → intentional stop
+            print("⚠️ Telegram polling returned. Restarting after 3s...")
+            time.sleep(3)
+            backoff = 1
+            continue
+        except telebot.apihelper.ApiTelegramException as e:
+            err_code = getattr(e, 'error_code', 0)
+            desc = getattr(e, 'description', str(e))
+            if err_code == 409:
+                # HTTP 409 Conflict — another process / another instance is running getUpdates
+                print(f"\n❌ TELEGRAM POLLING CONFLICT (HTTP 409):")
+                print(f"   {desc}")
+                print("   Likely cause: the OLD bot (with old token) or another bot process")
+                print("   is still running and calling getUpdates.")
+                if _bot_username:
+                    print(f"\n   If you just replaced BOT_TOKEN:")
+                    print(f"   → OLD bot (@???) with OLD token may still be polling. Stop it first.")
+                    print(f"   → Or: the old token's bot simply hasn't stopped yet on Telegram side.")
+                print(f"\n   Retrying in {backoff}s (backoff)...")
+                logging.error(f"Polling 409 conflict: {desc}. Backoff {backoff}s.")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+                restart_count += 1
+                continue
+            elif err_code in (401, 404):
+                # Token is now invalid mid-flight (revoked / banned) — FATAL
+                print(f"\n❌ FATAL: Telegram token REJECTED mid-polling (HTTP {err_code}).")
+                print(f"   Message: {desc}")
+                print("   Action: Get a NEW bot token from @BotFather, update BOT_TOKEN, restart.")
+                logging.critical(f"Polling: token rejected mid-flight HTTP {err_code}: {desc}. Exiting 1.")
+                sys.exit(1)
+            else:
+                logging.error(f"Polling ApiException HTTP {err_code}: {desc}. Backoff {backoff}s.")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+                restart_count += 1
+                continue
+        except Exception as e:
+            err_type = type(e).__name__
+            print(f"⚠️ Polling error ({err_type}): {e}")
+            print(f"   Restarting polling in {backoff}s...")
+            logging.error(f"Polling general error {err_type}: {e}. Backoff {backoff}s.")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+            restart_count += 1
+            continue
+
+    # We don't expect to exit here; if we do, something is very wrong
+    logging.critical("safe_start_polling: reached MAX_RESTARTS — exiting process.")
+    print("❌ MAX POLLING RESTARTS REACHED. Exiting.")
+    sys.exit(2)
+
 # ========== START BOT ==========
 if __name__ == "__main__":
     print("=" * 60)
-    print("🤖 PREMIUM BOT - TWO CHANNELS + DYNAMIC CONFIG")
+    print("🤖 PREMIUM BOT STARTING")
     print("=" * 60)
-    
-    print(f"✅ Bot Token: {BOT_TOKEN[:15]}...")
-    print(f"✅ Admin IDs: {', '.join(settings.get('admin_ids', []))}")
-    print(f"✅ Users Loaded: {len(users_data)}")
-    print(f"✅ Pending: {len(pending_verifications)}")
-    print(f"✅ Single Channel Price: ₹{settings.get('ch_price', '99')}")
-    print(f"✅ All Channels Price: ₹{settings.get('all_price', '299')}")
+
+    # ---------- STATUS REPORT (SAFE: NO SECRETS) ----------
+    s = config.startup_status
+    print(f"✅ Token validation:     {'PASS (verified)' if s['bot_token_valid'] else 'SKIP (deferred to polling)'}")
+    if '_bot_username' in dir() and _bot_username:
+        print(f"✅ Bot username:         @{_bot_username}")
+    if '_bot_id' in dir() and _bot_id:
+        print(f"✅ Bot numeric ID:       {_bot_id}")
+    print(f"✅ MongoDB connected:    {'YES' if s['mongo_connected'] else 'NO (JSON fallback)'}")
+    if s['mongo_error'] and not s['mongo_connected']:
+        print(f"⚠️  MongoDB last error:  {s['mongo_error'][:120]}")
+        print("ℹ️  (Your settings and user data remain safe in local data/*.json files.)")
+    print(f"✅ Config source:        {'MongoDB' if s['config_loaded_from_mongo'] else 'local JSON' if s['config_loaded_from_json'] else 'defaults (first run)'}")
+    admin_list = settings.get('admin_ids', [])
+    print(f"✅ Admins:               {len(admin_list)} configured{(' (IDs: ' + ', '.join(admin_list) + ')') if admin_list else ''}")
+    print(f"✅ Registered users:     {len(users_data)}")
+    print(f"✅ Pending payments:     {len(pending_verifications)}")
+    print(f"✅ Verified sales:       {len(sales_data)}")
+    print(f"✅ Premium channels:     {len(settings.get('premium_channels', []))}")
     print("=" * 60)
-    print("📋 Type /help for all commands")
-    print("📋 Type /settings to view/edit config")
+    print("📋 Admin: type /help in Telegram for all commands")
+    print("📋 Admin: type /settings in Telegram to view current config")
+    print("ℹ️  After token replacement: Existing admins & settings are AUTOMATICALLY restored from DB/JSON.")
+    print("ℹ️  Users must send /start to the NEW bot (old chat history does NOT transfer).")
     print("=" * 60)
-    
+
+    # Mark initialization complete in status even if polling start below throws
     try:
-        print("🚀 Bot is starting polling...")
-        bot.infinity_polling(
-            timeout=60, 
-            long_polling_timeout=60,
-            allowed_updates=["message", "callback_query", "chat_member", "chat_join_request"]
-        )
-    except Exception as e:
-        print(f"Bot Error: {e}")
-        time.sleep(10)
+        safe_start_polling()
+    except KeyboardInterrupt:
+        print("\n⏹️  Bot stopped by user (Ctrl+C). Saving data...")
+        try:
+            save_all_data()
+            print("💾 All data saved safely. Bye!")
+        except Exception as _e:
+            logging.error(f"Final save error: {_e}")
+        sys.exit(0)
+    except SystemExit:
+        raise
+    except Exception as _e:
+        logging.critical(f"Unhandled top-level exception: {type(_e).__name__}: {_e}")
+        print(f"❌ FATAL unhandled error: {type(_e).__name__}: {_e}")
+        try:
+            save_all_data()
+        except Exception as _e2:
+            logging.error(f"Final save also failed: {_e2}")
+        time.sleep(5)
         sys.exit(1)
