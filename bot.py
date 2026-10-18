@@ -340,6 +340,55 @@ def delete_message_after_delay(chat_id, message_id, delay=300, send_timeout_msg=
     timer.start()
     logging.info(f"Scheduled deletion for message {message_id} in {chat_id} after {delay} seconds")
 
+# ========== BOT-TOKEN MEDIA VALIDATION HELPERS ==========
+# Telegram file_id values are BOT-SPECIFIC. Any media (start message, demos,
+# screenshots) uploaded to the OLD bot becomes INVALID after the token is
+# replaced with a new bot. These helpers detect that specific error and fall
+# back gracefully instead of crashing the handler / leaving the user stuck.
+
+def _is_invalid_media_error(err):
+    """Return True if the Telegram error is 'wrong file identifier/HTTP URL specified' (400)."""
+    try:
+        desc = str(getattr(err, 'description', '') or err).lower()
+        code = getattr(err, 'error_code', None)
+        if 'wrong file identifier' in desc or 'wrong remote file identifier' in desc:
+            return True
+        if 'file identifier' in desc and 'http url' in desc:
+            return True
+        if code == 400 and 'file identifier' in desc:
+            return True
+    except Exception:
+        pass
+    return False
+
+_admin_invalid_media_warned = set()
+
+def _warn_admin_invalid_media(where):
+    """One-time admin alert telling them to re-upload media with the NEW bot."""
+    key = str(where)
+    if key in _admin_invalid_media_warned:
+        return
+    _admin_invalid_media_warned.add(key)
+    logging.error(
+        f"Invalid media file_id detected in '{where}'. Telegram file_ids are bot-specific: "
+        f"the OLD bot's file_ids do NOT work with the NEW bot token. Re-upload this media with the NEW bot."
+    )
+    msg = (
+        f"⚠️ <b>Media re-upload zaroori hai!</b>\n\n"
+        f"Jagah: <code>{where}</code>\n\n"
+        f"Telegram <code>file_id</code> har bot ke liye alag hota hai. "
+        f"Purane bot ke <code>file_id</code> naye bot ke saath kaam nahi karte.\n\n"
+        f"✅ <b>Fix (naye bot se media bhejo, phir reset karo):</b>\n"
+        f"• Custom start media → <code>/setstartmsg</code>\n"
+        f"• Start demos → <code>/clear_start_demos</code> phir <code>/set_start_demos</code>\n"
+        f"• Plan demos → <code>/clear_plan_demos &lt;plan&gt;</code> phir <code>/set_plan_demos</code>"
+    )
+    for aid in settings.get('admin_ids', []):
+        try:
+            bot.send_message(aid, msg, parse_mode="HTML")
+        except Exception:
+            pass
+
 def send_demo_videos(chat_id, video_list, caption=""):
     """Send demo items (media or text) and schedule deletion"""
     if not video_list:
@@ -365,6 +414,8 @@ def send_demo_videos(chat_id, video_list, caption=""):
                                 delete_message_after_delay(chat_id, m.message_id, delay=600)
                         except Exception as e:
                             logging.error(f"Error sending media group chunk: {e}")
+                            if _is_invalid_media_error(e):
+                                _warn_admin_invalid_media('start/plan demo media')
                     current_media_group = []
                 
                 # Send the text message
@@ -397,6 +448,8 @@ def send_demo_videos(chat_id, video_list, caption=""):
                     delete_message_after_delay(chat_id, m.message_id, delay=600)
             except Exception as e:
                 logging.error(f"Error sending media group chunk: {e}")
+                if _is_invalid_media_error(e):
+                    _warn_admin_invalid_media('start/plan demo media')
                 # Notify admin if type mismatch
                 if "can't use file of type" in str(e):
                     admin_ids = settings.get('admin_ids', [])
@@ -711,24 +764,54 @@ def handle_start(message):
                 media_type = start_message_data.get('media_type', '')
                 file_id = start_message_data.get('file_id', '')
 
+                def _start_text_fallback():
+                    """User ko menu zaroor mile — chahe media fail ho jaye."""
+                    if text and text.strip():
+                        try:
+                            fm = bot.send_message(
+                                chat_id,
+                                text,
+                                reply_markup=verif.main_menu_keyboard(),
+                                parse_mode="HTML"
+                            )
+                            track_msg(chat_id, fm.message_id)
+                            return
+                        except Exception:
+                            pass
+                    send_default_start(message)
+
                 if media_type == 'photo' and file_id:
-                    m = bot.send_photo(
-                        chat_id,
-                        photo=file_id,
-                        caption=text,
-                        reply_markup=verif.main_menu_keyboard(),
-                        parse_mode="HTML"
-                    )
-                    track_msg(chat_id, m.message_id)
+                    try:
+                        m = bot.send_photo(
+                            chat_id,
+                            photo=file_id,
+                            caption=text,
+                            reply_markup=verif.main_menu_keyboard(),
+                            parse_mode="HTML"
+                        )
+                        track_msg(chat_id, m.message_id)
+                    except Exception as _me:
+                        if _is_invalid_media_error(_me):
+                            _warn_admin_invalid_media('start message photo')
+                            _start_text_fallback()
+                        else:
+                            raise
                 elif media_type == 'video' and file_id:
-                    m = bot.send_video(
-                        chat_id,
-                        video=file_id,
-                        caption=text,
-                        reply_markup=verif.main_menu_keyboard(),
-                        parse_mode="HTML"
-                    )
-                    track_msg(chat_id, m.message_id)
+                    try:
+                        m = bot.send_video(
+                            chat_id,
+                            video=file_id,
+                            caption=text,
+                            reply_markup=verif.main_menu_keyboard(),
+                            parse_mode="HTML"
+                        )
+                        track_msg(chat_id, m.message_id)
+                    except Exception as _me:
+                        if _is_invalid_media_error(_me):
+                            _warn_admin_invalid_media('start message video')
+                            _start_text_fallback()
+                        else:
+                            raise
                 else:
                     send_default_start(message)
             else:
