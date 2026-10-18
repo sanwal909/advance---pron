@@ -394,6 +394,26 @@ def _warn_admin_invalid_media(where):
 # also download + store the actual bytes (config.media_cache_*). If a stored
 # file_id ever becomes invalid (new token), we re-upload the cached bytes with the
 # CURRENT bot to obtain a fresh file_id — no manual re-upload needed.
+#
+# Guard: if an OLDER config.py is deployed by mistake, the media_* helpers won't
+# exist. Detect that ONCE so a partial deploy degrades gracefully (with a loud
+# warning) instead of crashing the whole bot at startup.
+_MEDIA_API_READY = all(hasattr(config, _n) for _n in (
+    'media_new_id', 'media_cache_save', 'media_cache_get_bytes',
+    'media_cache_get_info', 'media_cache_delete', 'media_cache_count',
+    'MEDIA_MAX_BYTES'))
+if not _MEDIA_API_READY:
+    logging.error("config.py is OUTDATED — media auto-fetch helpers are MISSING. "
+                  "Deploy the full updated config.py, then restart. "
+                  "Bot will keep running but media auto-fetch is DISABLED.")
+
+def _media_cache_delete_safe(media_id):
+    """Delete a cached blob only if the media API is available. Never raises."""
+    if _MEDIA_API_READY and media_id:
+        try:
+            config.media_cache_delete(media_id)
+        except Exception:
+            pass
 
 def _message_media_file_id(msg):
     """Extract (file_id, type) from a telebot Message, or (None, None)."""
@@ -412,6 +432,8 @@ def _cache_replied_media(replied_msg):
     """Download media attached to `replied_msg` with the CURRENT bot and store its
     bytes in the persistent cache. Returns (media_id, file_type) or (None, ftype).
     Best-effort — never raises."""
+    if not _MEDIA_API_READY:
+        return None, None
     try:
         file_id, ftype = _message_media_file_id(replied_msg)
         if not file_id:
@@ -438,7 +460,7 @@ def _cache_replied_media(replied_msg):
 
 def _bio_from_cached(media_id, file_type):
     """Build a named BytesIO from a cached media blob, or None if not cached."""
-    if not media_id:
+    if not _MEDIA_API_READY or not media_id:
         return None
     data = config.media_cache_get_bytes(media_id)
     if not data:
@@ -2222,7 +2244,7 @@ def handle_clear_start_demos(message):
     
     for _it in list(settings.get('start_demo_videos', [])):
         if isinstance(_it, dict) and _it.get('media_id'):
-            config.media_cache_delete(_it.get('media_id'))
+            _media_cache_delete_safe(_it.get('media_id'))
     settings['start_demo_videos'] = []
     save_settings()
     bot.reply_to(message, "✅ Cleared /start demo videos.")
@@ -2318,7 +2340,7 @@ def handle_clear_plan_demos(message):
     if 'plan_demo_videos' in settings and plan_id in settings['plan_demo_videos']:
         for _it in list(settings['plan_demo_videos'].get(plan_id, [])):
             if isinstance(_it, dict) and _it.get('media_id'):
-                config.media_cache_delete(_it.get('media_id'))
+                _media_cache_delete_safe(_it.get('media_id'))
         del settings['plan_demo_videos'][plan_id]
         # Also clear description
         if 'plan_demo_descs' in settings and plan_id in settings['plan_demo_descs']:
@@ -3069,7 +3091,7 @@ def handle_set_start_message(message):
         if mid:
             start_message_data['media_id'] = mid
             if old_mid and old_mid != mid:
-                config.media_cache_delete(old_mid)
+                _media_cache_delete_safe(old_mid)
         else:
             start_message_data.pop('media_id', None)
     else:
@@ -3110,6 +3132,10 @@ def handle_get_start_message(message):
 def handle_media_check(message):
     """Admin: verify which media are safely cached in MongoDB (token-change safe)."""
     if not is_admin(message.from_user.id):
+        return
+
+    if not _MEDIA_API_READY:
+        bot.reply_to(message, "⚠️ <b>config.py outdated</b> — media cache helpers missing.\nDeploy the full updated <code>config.py</code> and restart.", parse_mode="HTML")
         return
 
     def _cached(item):
@@ -3160,7 +3186,7 @@ def handle_clear_start_message(message):
 
     global start_message_data
     if start_message_data.get('media_id'):
-        config.media_cache_delete(start_message_data.get('media_id'))
+        _media_cache_delete_safe(start_message_data.get('media_id'))
     start_message_data = {}
     save_start_message()
     bot.reply_to(message, "✅ Custom start message cleared")
@@ -3720,7 +3746,14 @@ if __name__ == "__main__":
     print(f"✅ Pending payments:     {len(pending_verifications)}")
     print(f"✅ Verified sales:       {len(sales_data)}")
     print(f"✅ Premium channels:     {len(settings.get('premium_channels', []))}")
-    print(f"✅ Cached media (Mongo): {config.media_cache_count()}  (token-change safe)")
+    if _MEDIA_API_READY:
+        try:
+            print(f"✅ Cached media (Mongo): {config.media_cache_count()}  (token-change safe)")
+        except Exception:
+            print("✅ Cached media (Mongo): (unavailable)")
+    else:
+        print("⚠️  Cached media:          DISABLED — config.py is OUTDATED (media_* helpers missing).")
+        print("⚠️  ACTION: redeploy the FULL updated config.py and delete __pycache__/, then restart.")
     print("=" * 60)
     print("📋 Admin: type /help in Telegram for all commands")
     print("📋 Admin: type /settings in Telegram to view current config")
