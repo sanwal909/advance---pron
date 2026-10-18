@@ -389,75 +389,250 @@ def _warn_admin_invalid_media(where):
         except Exception:
             pass
 
+# ========== MEDIA CACHE HELPERS (auto re-upload on token change) ==========
+# Telegram file_id is bot-specific. When the bot receives media from the admin we
+# also download + store the actual bytes (config.media_cache_*). If a stored
+# file_id ever becomes invalid (new token), we re-upload the cached bytes with the
+# CURRENT bot to obtain a fresh file_id — no manual re-upload needed.
+
+def _message_media_file_id(msg):
+    """Extract (file_id, type) from a telebot Message, or (None, None)."""
+    try:
+        if getattr(msg, 'photo', None):
+            return msg.photo[-1].file_id, 'photo'
+        if getattr(msg, 'video', None):
+            return msg.video.file_id, 'video'
+        if getattr(msg, 'document', None):
+            return msg.document.file_id, 'document'
+    except Exception:
+        pass
+    return None, None
+
+def _cache_replied_media(replied_msg):
+    """Download media attached to `replied_msg` with the CURRENT bot and store its
+    bytes in the persistent cache. Returns (media_id, file_type) or (None, ftype).
+    Best-effort — never raises."""
+    try:
+        file_id, ftype = _message_media_file_id(replied_msg)
+        if not file_id:
+            return None, None
+        file_name = ""
+        if getattr(replied_msg, 'document', None):
+            file_name = replied_msg.document.file_name or ""
+        file_info = bot.get_file(file_id)
+        if file_info.file_size and file_info.file_size > config.MEDIA_MAX_BYTES:
+            logging.warning(f"Media too large to cache ({file_info.file_size} bytes) — file_id-only mode.")
+            return None, ftype
+        downloaded = bot.download_file(file_info.file_path)
+        if not downloaded:
+            return None, ftype
+        if not file_name:
+            file_name = os.path.basename(file_info.file_path or "") or f"{ftype}.bin"
+        mid = config.media_new_id()
+        if config.media_cache_save(mid, downloaded, ftype, file_name=file_name) is None:
+            return None, ftype
+        return mid, ftype
+    except Exception as e:
+        logging.warning(f"_cache_replied_media failed: {type(e).__name__}")
+        return None, None
+
+def _bio_from_cached(media_id, file_type):
+    """Build a named BytesIO from a cached media blob, or None if not cached."""
+    if not media_id:
+        return None
+    data = config.media_cache_get_bytes(media_id)
+    if not data:
+        return None
+    bio = BytesIO(data)
+    info = config.media_cache_get_info(media_id) or {}
+    name = info.get('filename') or ''
+    if not name:
+        name = f"media.{'jpg' if file_type == 'photo' else ('mp4' if file_type == 'video' else 'bin')}"
+    bio.name = name
+    return bio
+
+def _input_media_for_item(item):
+    """Build an InputMedia for a demo item. Prefers the stored file_id, but falls
+    back to the cached bytes in MongoDB (auto-fetch) so file_id is NEVER required.
+    Returns an InputMedia object, or None if nothing usable is available."""
+    if not isinstance(item, dict):
+        return None
+    ftype = item.get('type', 'video')
+    if ftype not in ('photo', 'video', 'document'):
+        return None
+    src = item.get('id')
+    if not src:
+        src = _bio_from_cached(item.get('media_id'), ftype)
+        if src is None:
+            return None  # not in Mongo cache either → nothing we can send
+    if ftype == 'photo':
+        return types.InputMediaPhoto(src, parse_mode="HTML")
+    if ftype == 'video':
+        return types.InputMediaVideo(src, parse_mode="HTML")
+    return types.InputMediaDocument(src, parse_mode="HTML")
+
+def _reupload_cached_media(chat_id, media_id, file_type, caption="", reply_markup=None):
+    """Upload cached bytes with the CURRENT bot → (new_file_id, message) or (None, None)."""
+    bio = _bio_from_cached(media_id, file_type)
+    if bio is None:
+        return None, None
+    try:
+        if file_type == 'photo':
+            m = bot.send_photo(chat_id, photo=bio, caption=caption or "", reply_markup=reply_markup, parse_mode="HTML")
+        elif file_type == 'video':
+            m = bot.send_video(chat_id, video=bio, caption=caption or "", reply_markup=reply_markup, parse_mode="HTML")
+        else:
+            m = bot.send_document(chat_id, document=bio, caption=caption or "", reply_markup=reply_markup, parse_mode="HTML")
+        nfid, _ = _message_media_file_id(m)
+        return nfid, m
+    except Exception as e:
+        logging.error(f"_reupload_cached_media failed: {type(e).__name__}: {e}")
+        return None, None
+
+def _heal_start_message_media(chat_id, media_type, text, message):
+    """Re-upload the cached custom-start media to fix an invalid file_id after a
+    token change. Returns True if the media was successfully re-sent."""
+    mid = start_message_data.get('media_id')
+    if not mid:
+        _warn_admin_invalid_media('start message media')
+        return False
+    nfid, m = _reupload_cached_media(chat_id, mid, media_type, caption=text,
+                                     reply_markup=verif.main_menu_keyboard())
+    if m is None:
+        _warn_admin_invalid_media('start message media')
+        return False
+    if nfid:
+        start_message_data['file_id'] = nfid
+    save_start_message()
+    track_msg(chat_id, m.message_id)
+    logging.info("Start-message media healed from cache after token change.")
+    return True
+
+def _persist_fresh_file_ids(msgs, items):
+    """After a successful media-group send, capture the fresh file_ids Telegram
+    assigned and store them back into the settings items (auto file_id cache).
+    file_id is OPTIONAL — this only makes future sends faster. Never raises."""
+    try:
+        changed = False
+        for m, it in zip(msgs, items or []):
+            if not isinstance(it, dict):
+                continue
+            nfid, _ = _message_media_file_id(m)
+            if nfid and it.get('id') != nfid:
+                it['id'] = nfid  # same dict object lives inside settings → persisted
+                changed = True
+        if changed:
+            save_settings()
+    except Exception as e:
+        logging.warning(f"_persist_fresh_file_ids failed: {type(e).__name__}")
+
+def _send_media_chunk(chat_id, chunk, items, chat_id_str):
+    """Send one media-group chunk. If the stored file_ids are invalid (token
+    change), rebuild the chunk from the persistent media cache, capture the fresh
+    file_ids and persist them back into settings. Returns True on success."""
+    if not chunk:
+        return True
+    try:
+        msgs = bot.send_media_group(chat_id, chunk)
+        _persist_fresh_file_ids(msgs, items)
+        for m in msgs:
+            user_demo_messages[chat_id_str].append(m.message_id)
+            delete_message_after_delay(chat_id, m.message_id, delay=600)
+        return True
+    except Exception as e:
+        logging.error(f"Error sending media group chunk: {e}")
+        if not _is_invalid_media_error(e):
+            if "can't use file of type" in str(e):
+                for aid in settings.get('admin_ids', []):
+                    try:
+                        bot.send_message(aid, "⚠️ <b>Demo Media Error!</b>\n\nSome files have wrong types. Please clear and reset using reply method.", parse_mode="HTML")
+                    except Exception:
+                        pass
+            return False
+        # ---- Token-change heal: rebuild chunk from cached bytes ----
+        healed_chunk, healed_items = [], []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            ftype = it.get('type', 'video')
+            bio = _bio_from_cached(it.get('media_id'), ftype)
+            if bio is None:
+                continue
+            if ftype == 'photo':
+                healed_chunk.append(types.InputMediaPhoto(bio, parse_mode="HTML"))
+            elif ftype == 'video':
+                healed_chunk.append(types.InputMediaVideo(bio, parse_mode="HTML"))
+            else:
+                healed_chunk.append(types.InputMediaDocument(bio, parse_mode="HTML"))
+            healed_items.append(it)
+        if not healed_chunk:
+            _warn_admin_invalid_media('start/plan demo media')
+            return False
+        try:
+            msgs = bot.send_media_group(chat_id, healed_chunk)
+            for m in msgs:
+                user_demo_messages[chat_id_str].append(m.message_id)
+                delete_message_after_delay(chat_id, m.message_id, delay=600)
+            _persist_fresh_file_ids(msgs, healed_items)
+            logging.info("Demo media healed from cache after token change.")
+            if len(healed_items) < len(items):
+                _warn_admin_invalid_media('some demo media (not cached)')
+            return True
+        except Exception as e2:
+            logging.error(f"Demo media heal failed: {e2}")
+            _warn_admin_invalid_media('start/plan demo media')
+            return False
+
 def send_demo_videos(chat_id, video_list, caption=""):
-    """Send demo items (media or text) and schedule deletion"""
+    """Send demo items (media or text) and schedule deletion.
+    Stored file_ids are auto-healed from the media cache on token change."""
     if not video_list:
         return
-    
+
     chat_id_str = str(chat_id)
     if chat_id_str not in user_demo_messages:
         user_demo_messages[chat_id_str] = []
-    
+
     current_media_group = []
+    current_media_items = []
+
+    def _flush(chunk, items):
+        if not chunk:
+            return
+        for i in range(0, len(chunk), 10):
+            _send_media_chunk(chat_id, chunk[i:i + 10], items[i:i + 10], chat_id_str)
+
     for item in video_list:
         try:
             # Check if it's a text item
             if isinstance(item, dict) and item.get('type') == 'text':
-                # First send any pending media group
-                if current_media_group:
-                    for i in range(0, len(current_media_group), 10):
-                        chunk = current_media_group[i:i + 10]
-                        try:
-                            msgs = bot.send_media_group(chat_id, chunk)
-                            for m in msgs:
-                                user_demo_messages[chat_id_str].append(m.message_id)
-                                delete_message_after_delay(chat_id, m.message_id, delay=600)
-                        except Exception as e:
-                            logging.error(f"Error sending media group chunk: {e}")
-                            if _is_invalid_media_error(e):
-                                _warn_admin_invalid_media('start/plan demo media')
-                    current_media_group = []
-                
+                _flush(current_media_group, current_media_items)
+                current_media_group, current_media_items = [], []
+
                 # Send the text message
                 txt_msg = bot.send_message(chat_id, item.get('text', ''), parse_mode="HTML", disable_web_page_preview=False)
                 user_demo_messages[chat_id_str].append(txt_msg.message_id)
                 delete_message_after_delay(chat_id, txt_msg.message_id, delay=600)
-                
+
             elif isinstance(item, dict):
-                fid = item.get('id')
-                ftype = item.get('type', 'video')
-                if ftype == 'photo':
-                    current_media_group.append(types.InputMediaPhoto(fid, parse_mode="HTML"))
-                elif ftype == 'video':
-                    current_media_group.append(types.InputMediaVideo(fid, parse_mode="HTML"))
+                # file_id is optional — _input_media_for_item falls back to MongoDB cache
+                media = _input_media_for_item(item)
+                if media is None:
+                    logging.warning("Demo media item has no file_id and no cached bytes — skipped.")
+                    _warn_admin_invalid_media('demo media (no file_id / no cache)')
+                    continue
+                current_media_group.append(media)
+                current_media_items.append(item)
             else:
                 # Fallback for old string format
                 current_media_group.append(types.InputMediaVideo(item, parse_mode="HTML"))
+                current_media_items.append({"id": item, "type": "video"})
         except Exception as e:
             logging.error(f"Error preparing demo item: {e}")
             continue
-    
+
     # Send any remaining media group
-    if current_media_group:
-        for i in range(0, len(current_media_group), 10):
-            chunk = current_media_group[i:i + 10]
-            try:
-                msgs = bot.send_media_group(chat_id, chunk)
-                for m in msgs:
-                    user_demo_messages[chat_id_str].append(m.message_id)
-                    delete_message_after_delay(chat_id, m.message_id, delay=600)
-            except Exception as e:
-                logging.error(f"Error sending media group chunk: {e}")
-                if _is_invalid_media_error(e):
-                    _warn_admin_invalid_media('start/plan demo media')
-                # Notify admin if type mismatch
-                if "can't use file of type" in str(e):
-                    admin_ids = settings.get('admin_ids', [])
-                    if admin_ids:
-                        error_msg = "⚠️ <b>Demo Media Error!</b>\n\nSome files have wrong types. Please clear and reset using reply method."
-                        for aid in admin_ids:
-                            try: bot.send_message(aid, error_msg, parse_mode="HTML")
-                            except: pass
+    _flush(current_media_group, current_media_items)
 
     # Send Description as a separate message
     if caption:
@@ -780,38 +955,36 @@ def handle_start(message):
                             pass
                     send_default_start(message)
 
-                if media_type == 'photo' and file_id:
-                    try:
-                        m = bot.send_photo(
-                            chat_id,
-                            photo=file_id,
-                            caption=text,
-                            reply_markup=verif.main_menu_keyboard(),
-                            parse_mode="HTML"
-                        )
-                        track_msg(chat_id, m.message_id)
-                    except Exception as _me:
-                        if _is_invalid_media_error(_me):
-                            _warn_admin_invalid_media('start message photo')
+                if media_type in ('photo', 'video'):
+                    if not file_id:
+                        # file_id is OPTIONAL — resolve the media from the MongoDB cache
+                        if not _heal_start_message_media(chat_id, media_type, text, message):
                             _start_text_fallback()
-                        else:
-                            raise
-                elif media_type == 'video' and file_id:
-                    try:
-                        m = bot.send_video(
-                            chat_id,
-                            video=file_id,
-                            caption=text,
-                            reply_markup=verif.main_menu_keyboard(),
-                            parse_mode="HTML"
-                        )
-                        track_msg(chat_id, m.message_id)
-                    except Exception as _me:
-                        if _is_invalid_media_error(_me):
-                            _warn_admin_invalid_media('start message video')
-                            _start_text_fallback()
-                        else:
-                            raise
+                    else:
+                        try:
+                            if media_type == 'photo':
+                                m = bot.send_photo(
+                                    chat_id,
+                                    photo=file_id,
+                                    caption=text,
+                                    reply_markup=verif.main_menu_keyboard(),
+                                    parse_mode="HTML"
+                                )
+                            else:
+                                m = bot.send_video(
+                                    chat_id,
+                                    video=file_id,
+                                    caption=text,
+                                    reply_markup=verif.main_menu_keyboard(),
+                                    parse_mode="HTML"
+                                )
+                            track_msg(chat_id, m.message_id)
+                        except Exception as _me:
+                            if _is_invalid_media_error(_me):
+                                if not _heal_start_message_media(chat_id, media_type, text, message):
+                                    _start_text_fallback()
+                            else:
+                                raise
                 else:
                     send_default_start(message)
             else:
@@ -2005,6 +2178,11 @@ def handle_set_start_demos(message):
             item = {"id": fid, "type": ftype}
             
         if item:
+            if item.get('type') != 'text':
+                # Cache raw bytes for token-change auto re-upload
+                mid, _ = _cache_replied_media(reply)
+                if mid:
+                    item['media_id'] = mid
             if 'start_demo_videos' not in settings:
                 settings['start_demo_videos'] = []
             
@@ -2042,6 +2220,9 @@ def handle_clear_start_demos(message):
     if not is_admin(message.from_user.id):
         return
     
+    for _it in list(settings.get('start_demo_videos', [])):
+        if isinstance(_it, dict) and _it.get('media_id'):
+            config.media_cache_delete(_it.get('media_id'))
     settings['start_demo_videos'] = []
     save_settings()
     bot.reply_to(message, "✅ Cleared /start demo videos.")
@@ -2081,6 +2262,11 @@ def handle_set_plan_demos(message):
             item = {"id": fid, "type": ftype}
             
         if item:
+            if item.get('type') != 'text':
+                # Cache raw bytes for token-change auto re-upload
+                mid, _ = _cache_replied_media(reply)
+                if mid:
+                    item['media_id'] = mid
             if 'plan_demo_videos' not in settings:
                 settings['plan_demo_videos'] = {}
             if plan_id not in settings['plan_demo_videos']:
@@ -2130,6 +2316,9 @@ def handle_clear_plan_demos(message):
     
     plan_id = args[1]
     if 'plan_demo_videos' in settings and plan_id in settings['plan_demo_videos']:
+        for _it in list(settings['plan_demo_videos'].get(plan_id, [])):
+            if isinstance(_it, dict) and _it.get('media_id'):
+                config.media_cache_delete(_it.get('media_id'))
         del settings['plan_demo_videos'][plan_id]
         # Also clear description
         if 'plan_demo_descs' in settings and plan_id in settings['plan_demo_descs']:
@@ -2872,7 +3061,20 @@ def handle_set_start_message(message):
         start_message_data['media_type'] = 'document'
         start_message_data['file_id'] = replied_msg.document.file_id
         start_message_data['has_media'] = True
-    
+
+    # Cache the raw bytes so a future token change can auto re-upload (no manual redo)
+    if start_message_data.get('has_media'):
+        old_mid = start_message_data.get('media_id')
+        mid, _ = _cache_replied_media(replied_msg)
+        if mid:
+            start_message_data['media_id'] = mid
+            if old_mid and old_mid != mid:
+                config.media_cache_delete(old_mid)
+        else:
+            start_message_data.pop('media_id', None)
+    else:
+        start_message_data.pop('media_id', None)
+
     save_start_message()
     bot.reply_to(message, "✅ Start message updated!")
 
@@ -2903,6 +3105,52 @@ def handle_get_start_message(message):
     
     bot.reply_to(message, info_msg, parse_mode="HTML")
 
+# ========== /MEDIA_CHECK COMMAND ==========
+@bot.message_handler(commands=['media_check'])
+def handle_media_check(message):
+    """Admin: verify which media are safely cached in MongoDB (token-change safe)."""
+    if not is_admin(message.from_user.id):
+        return
+
+    def _cached(item):
+        if not isinstance(item, dict):
+            return False
+        mid = item.get('media_id')
+        return bool(mid) and (config.media_cache_get_bytes(mid) is not None)
+
+    def _media_only(items):
+        return [x for x in (items or []) if isinstance(x, dict) and x.get('type') != 'text']
+
+    lines = ["<b>🗂 MEDIA CACHE STATUS</b>", ""]
+
+    if start_message_data and start_message_data.get('has_media'):
+        ok = _cached(start_message_data)
+        lines.append(f"• Start message media: {'✅ cached' if ok else '❌ NOT cached'}")
+    else:
+        lines.append("• Start message media: ➖ not set")
+
+    sd = _media_only(settings.get('start_demo_videos', []))
+    if settings.get('start_demo_videos'):
+        lines.append(f"• Start demos: {sum(1 for x in sd if _cached(x))}/{len(sd)} media cached")
+    else:
+        lines.append("• Start demos: ➖ none")
+
+    pd = settings.get('plan_demo_videos', {})
+    if pd:
+        for plan_id, items in pd.items():
+            mi = _media_only(items)
+            lines.append(f"• Plan '{plan_id}' demos: {sum(1 for x in mi if _cached(x))}/{len(mi)} cached")
+    else:
+        lines.append("• Plan demos: ➖ none")
+
+    lines.append("")
+    lines.append(f"Total blobs in cache: <b>{config.media_cache_count()}</b>")
+    lines.append("")
+    lines.append("✅ = token change ke baad auto re-upload ho jayega")
+    lines.append("❌ = ek baar dobara set karna hoga (reply method se)")
+
+    bot.reply_to(message, "\n".join(lines), parse_mode="HTML")
+
 # ========== /CLEARSTARTMSG COMMAND ==========
 @bot.message_handler(commands=['clearstartmsg'])
 def handle_clear_start_message(message):
@@ -2911,6 +3159,8 @@ def handle_clear_start_message(message):
         return
 
     global start_message_data
+    if start_message_data.get('media_id'):
+        config.media_cache_delete(start_message_data.get('media_id'))
     start_message_data = {}
     save_start_message()
     bot.reply_to(message, "✅ Custom start message cleared")
@@ -3470,6 +3720,7 @@ if __name__ == "__main__":
     print(f"✅ Pending payments:     {len(pending_verifications)}")
     print(f"✅ Verified sales:       {len(sales_data)}")
     print(f"✅ Premium channels:     {len(settings.get('premium_channels', []))}")
+    print(f"✅ Cached media (Mongo): {config.media_cache_count()}  (token-change safe)")
     print("=" * 60)
     print("📋 Admin: type /help in Telegram for all commands")
     print("📋 Admin: type /settings in Telegram to view current config")
