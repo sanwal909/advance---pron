@@ -428,6 +428,29 @@ def _message_media_file_id(msg):
         pass
     return None, None
 
+def _cache_file_id(file_id, ftype, file_name=""):
+    """Download a (currently valid) file_id with the CURRENT bot and store its bytes
+    in the persistent cache. Returns media_id or None. Never raises."""
+    if not _MEDIA_API_READY or not file_id:
+        return None
+    try:
+        file_info = bot.get_file(file_id)
+        if file_info.file_size and file_info.file_size > config.MEDIA_MAX_BYTES:
+            logging.warning(f"Media too large to cache ({file_info.file_size} bytes) — file_id-only mode.")
+            return None
+        downloaded = bot.download_file(file_info.file_path)
+        if not downloaded:
+            return None
+        if not file_name:
+            file_name = os.path.basename(file_info.file_path or "") or f"{ftype or 'file'}.bin"
+        mid = config.media_new_id()
+        if config.media_cache_save(mid, downloaded, ftype, file_name=file_name) is None:
+            return None
+        return mid
+    except Exception as e:
+        logging.warning(f"_cache_file_id failed: {type(e).__name__}")
+        return None
+
 def _cache_replied_media(replied_msg):
     """Download media attached to `replied_msg` with the CURRENT bot and store its
     bytes in the persistent cache. Returns (media_id, file_type) or (None, ftype).
@@ -441,18 +464,7 @@ def _cache_replied_media(replied_msg):
         file_name = ""
         if getattr(replied_msg, 'document', None):
             file_name = replied_msg.document.file_name or ""
-        file_info = bot.get_file(file_id)
-        if file_info.file_size and file_info.file_size > config.MEDIA_MAX_BYTES:
-            logging.warning(f"Media too large to cache ({file_info.file_size} bytes) — file_id-only mode.")
-            return None, ftype
-        downloaded = bot.download_file(file_info.file_path)
-        if not downloaded:
-            return None, ftype
-        if not file_name:
-            file_name = os.path.basename(file_info.file_path or "") or f"{ftype}.bin"
-        mid = config.media_new_id()
-        if config.media_cache_save(mid, downloaded, ftype, file_name=file_name) is None:
-            return None, ftype
+        mid = _cache_file_id(file_id, ftype, file_name)
         return mid, ftype
     except Exception as e:
         logging.warning(f"_cache_replied_media failed: {type(e).__name__}")
@@ -3126,6 +3138,90 @@ def handle_get_start_message(message):
     """
     
     bot.reply_to(message, info_msg, parse_mode="HTML")
+
+# ========== /MEDIA_CACHE_NOW COMMAND ==========
+@bot.message_handler(commands=['media_cache_now', 'cache_media'])
+def handle_media_cache_now(message):
+    """Admin: fetch & save EVERY currently-configured media into MongoDB so a future
+    token change auto-restores it. Uses the CURRENT (valid) file_ids — no re-upload."""
+    if not is_admin(message.from_user.id):
+        return
+    if not _MEDIA_API_READY:
+        bot.reply_to(message, "⚠️ <b>config.py outdated</b> — media cache helpers missing.\nDeploy the full updated <code>config.py</code> and restart.", parse_mode="HTML")
+        return
+
+    bot.reply_to(message, "⏳ Media cache ho raha hai... thoda time lagega, please wait. (Command khatam hone par report aayegi.)")
+
+    saved = 0
+    failed = 0
+    failed_items = []
+
+    # 1) Custom start message media
+    try:
+        if start_message_data.get('has_media') and start_message_data.get('file_id') \
+                and not start_message_data.get('media_id'):
+            mid = _cache_file_id(start_message_data.get('file_id'),
+                                 start_message_data.get('media_type', 'photo'))
+            if mid:
+                start_message_data['media_id'] = mid
+                save_start_message()
+                saved += 1
+            else:
+                failed += 1
+                failed_items.append("Start message media")
+    except Exception as e:
+        logging.error(f"media_cache_now (start message): {e}")
+
+    # 2) Demo lists (start demos + every plan's demos)
+    def _backfill_list(items, label):
+        nonlocal saved, failed
+        for idx, it in enumerate(items or []):
+            if not isinstance(it, dict) or it.get('type') == 'text':
+                continue
+            if it.get('media_id'):
+                continue  # already cached
+            fid = it.get('id')
+            if not fid:
+                failed += 1
+                failed_items.append(f"{label} #{idx + 1} (no file_id)")
+                continue
+            mid = _cache_file_id(fid, it.get('type', 'video'))
+            if mid:
+                it['media_id'] = mid
+                saved += 1
+            else:
+                failed += 1
+                failed_items.append(f"{label} #{idx + 1} (download failed / too large)")
+
+    try:
+        _backfill_list(settings.get('start_demo_videos', []), "Start demos")
+    except Exception as e:
+        logging.error(f"media_cache_now (start demos): {e}")
+    try:
+        for plan_id, items in (settings.get('plan_demo_videos', {}) or {}).items():
+            _backfill_list(items, f"Plan '{plan_id}'")
+    except Exception as e:
+        logging.error(f"media_cache_now (plan demos): {e}")
+
+    if saved:
+        save_settings()
+
+    report = [
+        "✅ <b>MEDIA CACHE UPDATE</b>", "",
+        f"Newly cached: <b>{saved}</b>",
+        f"Failed: <b>{failed}</b>",
+        f"Total blobs in cache: <b>{config.media_cache_count()}</b>", "",
+    ]
+    if failed_items:
+        report.append("⚠️ <b>Ye items cache nahi ho paaye</b> (20MB se bade ho sakte hain):")
+        report.extend(f"• {x}" for x in failed_items[:20])
+        report.append("")
+        report.append("Inhe ek baar reply-method se dobara set karo (chhota/compressed file):")
+        report.append("<code>/setstartmsg</code> / <code>/set_start_demos</code> / <code>/set_plan_demos &lt;plan&gt;</code>")
+        report.append("")
+    report.append("Ab <code>/media_check</code> chalao — ✅ dikhna chahiye.")
+
+    bot.send_message(message.chat.id, "\n".join(report), parse_mode="HTML")
 
 # ========== /MEDIA_CHECK COMMAND ==========
 @bot.message_handler(commands=['media_check'])
