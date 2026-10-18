@@ -2,6 +2,7 @@ import json
 import os
 import re
 import time
+import uuid
 from datetime import datetime, timedelta
 import logging
 from dotenv import load_dotenv
@@ -254,6 +255,176 @@ INVITE_LINKS_FILE = os.path.join(DATA_DIR, "invite_links.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 JOIN_REQUESTS_FILE = os.path.join(DATA_DIR, "join_requests.json")
 SALES_DATA_FILE = os.path.join(DATA_DIR, "sales_data.json")
+
+# ============ MEDIA CACHE (token-change safe) ============
+# Telegram file_id is BOT-SPECIFIC: media uploaded to the OLD bot cannot be sent
+# by a NEW bot. To survive a BOT_TOKEN change we ALSO store the actual file bytes
+# (GridFS inside the existing 'PremiumBot' DB; local disk as mirror) so the new bot
+# can re-upload them and obtain a fresh, valid file_id automatically.
+MEDIA_DIR = os.path.join(DATA_DIR, "media")
+try:
+    os.makedirs(MEDIA_DIR, exist_ok=True)
+except Exception:
+    pass
+MEDIA_MANIFEST_FILE = os.path.join(MEDIA_DIR, "manifest.json")
+MEDIA_MAX_BYTES = 20 * 1024 * 1024  # Telegram getFile download limit (20 MB)
+
+def media_new_id():
+    """Generate a stable, token-independent media identifier."""
+    return uuid.uuid4().hex
+
+def _get_media_bucket():
+    """GridFS bucket on the existing DB, or None if Mongo is unavailable."""
+    if db is None:
+        return None
+    try:
+        client.admin.command('ping')
+    except Exception:
+        return None
+    try:
+        import gridfs
+        return gridfs.GridFS(db, collection="media_files")
+    except Exception as e:
+        logging.warning(f"GridFS unavailable: {type(e).__name__}")
+        return None
+
+def _media_local_manifest_read():
+    try:
+        with open(MEDIA_MANIFEST_FILE, 'r', encoding='utf-8') as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def _media_local_manifest_write(m):
+    try:
+        tmp = MEDIA_MANIFEST_FILE + ".tmp"
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(m, f)
+        os.replace(tmp, MEDIA_MANIFEST_FILE)
+    except Exception:
+        pass
+
+def media_cache_save(media_id, data, file_type, file_name="", mime=""):
+    """Persist raw media bytes + metadata. GridFS primary, local disk mirror.
+    Returns an info dict on success, None on failure. Never raises."""
+    if not media_id or not data:
+        return None
+    if len(data) > MEDIA_MAX_BYTES:
+        logging.warning(f"media_cache_save: file too large ({len(data)} bytes > {MEDIA_MAX_BYTES}); not cached.")
+        return None
+    info = {
+        "type": file_type or "",
+        "filename": file_name or "",
+        "mime": mime or "",
+        "size": len(data),
+    }
+    stored = False
+    bucket = _get_media_bucket()
+    if bucket is not None:
+        try:
+            try:
+                bucket.delete(media_id)
+            except Exception:
+                pass
+            bucket.put(data, _id=media_id, filename=(file_name or media_id),
+                       content_type=(mime or "application/octet-stream"))
+            info["storage"] = "gridfs"
+            stored = True
+        except Exception as e:
+            logging.warning(f"media_cache_save: GridFS write failed: {type(e).__name__}")
+    try:
+        with open(os.path.join(MEDIA_DIR, media_id), 'wb') as f:
+            f.write(data)
+        if not stored:
+            info["storage"] = "local"
+        stored = True
+    except Exception as e:
+        logging.warning(f"media_cache_save: local write failed: {type(e).__name__}")
+    if not stored:
+        return None
+    col = get_collection("media_cache")
+    if col is not None:
+        try:
+            doc = {"_id": media_id}
+            doc.update(info)
+            col.replace_one({"_id": media_id}, doc, upsert=True)
+        except Exception:
+            pass
+    m = _media_local_manifest_read()
+    m[media_id] = info
+    _media_local_manifest_write(m)
+    return info
+
+def media_cache_get_info(media_id):
+    if not media_id:
+        return None
+    col = get_collection("media_cache")
+    if col is not None:
+        try:
+            d = col.find_one({"_id": media_id})
+            if d:
+                d.pop("_id", None)
+                return d
+        except Exception:
+            pass
+    return _media_local_manifest_read().get(media_id)
+
+def media_cache_get_bytes(media_id):
+    """Return raw bytes for a media_id, or None. Never raises."""
+    if not media_id:
+        return None
+    bucket = _get_media_bucket()
+    if bucket is not None:
+        try:
+            gf = bucket.get(media_id)
+            if gf is not None:
+                return gf.read()
+        except Exception:
+            pass
+    try:
+        with open(os.path.join(MEDIA_DIR, media_id), 'rb') as f:
+            return f.read()
+    except Exception:
+        return None
+
+def media_cache_delete(media_id):
+    """Remove a cached media blob + manifest entry. Never raises."""
+    if not media_id:
+        return
+    bucket = _get_media_bucket()
+    if bucket is not None:
+        try:
+            bucket.delete(media_id)
+        except Exception:
+            pass
+    try:
+        os.remove(os.path.join(MEDIA_DIR, media_id))
+    except Exception:
+        pass
+    col = get_collection("media_cache")
+    if col is not None:
+        try:
+            col.delete_one({"_id": media_id})
+        except Exception:
+            pass
+    m = _media_local_manifest_read()
+    if media_id in m:
+        m.pop(media_id, None)
+        _media_local_manifest_write(m)
+
+def media_cache_count():
+    """Number of media blobs currently cached (GridFS preferred, local fallback)."""
+    bucket = _get_media_bucket()
+    if bucket is not None:
+        try:
+            return len(list(bucket.find({})))
+        except Exception:
+            pass
+    try:
+        return len(_media_local_manifest_read())
+    except Exception:
+        return 0
 
 # ============ DEFAULT SETTINGS ============
 DEFAULT_SETTINGS = {
