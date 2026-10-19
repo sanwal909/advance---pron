@@ -869,8 +869,17 @@ class PremiumBot:
     
     def generate_qr_code(self, upi_id, amount, name):
         try:
+            # Accept '100', '₹100', '100rs' etc. — reject anything non-numeric safely
+            amt = config.parse_amount(amount)
+            if amt is None:
+                logging.error(
+                    "QR Generation Error: invalid amount %r — plan amount must be a "
+                    "plain number like 100 or 99.50 (no 'rs'/'₹').",
+                    amount
+                )
+                return None
             # Format amount to 2 decimal places for UPI standard
-            formatted_amount = "{:.2f}".format(float(amount))
+            formatted_amount = "{:.2f}".format(amt)
             upi_url = f"upi://pay?pa={upi_id}&pn={name.replace(' ', '%20')}&am={formatted_amount}&cu=INR"
             
             qr = qrcode.QRCode(
@@ -1219,6 +1228,19 @@ Jab tak admin purane payment ko verify/reject nahi kar dete, aap naya payment cr
         bot.answer_callback_query(call.id, "❌ Plan not found!", show_alert=True)
         return
 
+    # Generate QR FIRST — fail fast (and cleanly) if this plan's amount is invalid,
+    # instead of raising an error later and leaving a broken order.
+    qr_image = premium_bot.generate_qr_code(settings['upi_id'], plan['amount'], settings['upi_name'])
+    if qr_image is None:
+        logging.error(f"Order blocked: invalid amount for plan {plan_type}: {plan['amount']!r}")
+        bot.answer_callback_query(
+            call.id,
+            "⚠️ Payment QR is unavailable for this plan.\n"
+            "Admin: plan ka amount sahi karo (sirf number, jaise 100).",
+            show_alert=True
+        )
+        return
+
     settings['total_orders'] = settings.get('total_orders', 0) + 1
     order_num = settings['total_orders']
     save_settings()
@@ -1231,8 +1253,6 @@ Jab tak admin purane payment ko verify/reject nahi kar dete, aap naya payment cr
         'username': call.from_user.username,
         'first_name': call.from_user.first_name
     }
-
-    qr_image = premium_bot.generate_qr_code(settings['upi_id'], plan['amount'], settings['upi_name'])
 
     caption = f"""
 <b>💰 ORDER #{order_num}: PAY ₹{plan['amount']} FOR {plan['name'].upper()}</b>
@@ -1954,7 +1974,7 @@ def handle_sales(message):
     for sale in sales_data:
         try:
             sale_date = datetime.strptime(sale['date'], "%Y-%m-%d")
-            amount = float(sale['amount'])
+            amount = config.parse_amount(sale.get('amount'), 0.0) or 0.0
             upi = sale.get('upi_id', 'Unknown')
             
             if upi not in upi_sales:
@@ -2447,6 +2467,12 @@ Example: <code>/add_premium_ch ch1 Randi Ki Dukan 99 -100xxx green</code>""", pa
 
         resolved_color = resolve_color(color_raw)
 
+        _amt = config.parse_amount(price)
+        if _amt is None:
+            bot.reply_to(message, "❌ <b>Invalid amount!</b>\nSirf number likho, jaise <code>100</code> ya <code>99.50</code>.\n(<code>rs</code>/<code>₹</code> likhna zaroori nahi.)", parse_mode="HTML")
+            return
+        price = config.clean_amount_str(_amt)
+
         if 'premium_channels' not in settings:
             settings['premium_channels'] = []
 
@@ -2685,6 +2711,13 @@ Keys: <code>name, amount, channel_id, duration, description, color</code>
                 bot.reply_to(message, f"❌ Channel ID {ch_id} not found.")
             return
 
+        if key == 'amount':
+            _amt = config.parse_amount(value)
+            if _amt is None:
+                bot.reply_to(message, "❌ <b>Invalid amount!</b>\nSirf number likho, jaise <code>100</code> ya <code>99.50</code>.\n(<code>rs</code>/<code>₹</code> likhna zaroori nahi.)", parse_mode="HTML")
+                return
+            value = config.clean_amount_str(_amt)
+
         found = False
         for ch in settings.get('premium_channels', []):
             if ch['id'] == ch_id:
@@ -2712,6 +2745,12 @@ def handle_set_price(message):
         
     type_ = args[1].lower()
     amount = args[2]
+
+    _amt = config.parse_amount(amount)
+    if _amt is None:
+        bot.reply_to(message, "❌ <b>Invalid amount!</b>\nSirf number likho, jaise <code>100</code> ya <code>99.50</code>.\n(<code>rs</code>/<code>₹</code> likhna zaroori nahi.)", parse_mode="HTML")
+        return
+    amount = config.clean_amount_str(_amt)
     
     if type_ == "single":
         settings['ch_price'] = amount
