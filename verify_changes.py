@@ -405,6 +405,77 @@ class TestMongoRetry(unittest.TestCase):
             c.MONGO_URI = original_uri
 
 # =====================================================================
+# TEST GROUP 8 — Media cache (token-change auto re-upload)
+# =====================================================================
+class TestMediaCache(unittest.TestCase):
+    """Media bytes are cached persistently so a new bot token can re-upload them."""
+
+    def test_save_get_roundtrip_and_delete(self):
+        import config as c
+        mid = c.media_new_id()
+        payload = b"\x89PNG\r\n\x1a\nFAKE-IMAGE-BYTES-1234567890"
+        info = c.media_cache_save(mid, payload, "photo", file_name="pic.jpg")
+        self.assertIsNotNone(info, "media_cache_save should succeed (local fallback at minimum)")
+        self.assertEqual(info.get("type"), "photo")
+        self.assertEqual(c.media_cache_get_bytes(mid), payload)
+        meta = c.media_cache_get_info(mid)
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta.get("filename"), "pic.jpg")
+        c.media_cache_delete(mid)
+        self.assertIsNone(c.media_cache_get_bytes(mid), "delete should remove the blob")
+        self.assertIsNone(c.media_cache_get_info(mid), "delete should remove the manifest entry")
+
+    def test_missing_media_returns_none(self):
+        import config as c
+        self.assertIsNone(c.media_cache_get_bytes("does-not-exist-" + c.media_new_id()))
+        self.assertIsNone(c.media_cache_get_info("does-not-exist-" + c.media_new_id()))
+
+    def test_oversize_rejected(self):
+        import config as c
+        mid = c.media_new_id()
+        big = b"x" * (c.MEDIA_MAX_BYTES + 10)
+        self.assertIsNone(c.media_cache_save(mid, big, "video"), "oversize media must not be cached")
+
+    def test_empty_input_rejected(self):
+        import config as c
+        self.assertIsNone(c.media_cache_save("", b"data", "photo"))
+        self.assertIsNone(c.media_cache_save(c.media_new_id(), b"", "photo"))
+
+    def test_count_tracks_save_and_delete(self):
+        import config as c
+        before = c.media_cache_count()
+        mid = c.media_new_id()
+        c.media_cache_save(mid, b"count-test-bytes-123", "photo", file_name="c.jpg")
+        self.assertEqual(c.media_cache_count(), before + 1)
+        c.media_cache_delete(mid)
+        self.assertEqual(c.media_cache_count(), before)
+
+class TestAmountParsing(unittest.TestCase):
+    """Prices are admin-entered text — '100rs' must never crash QR generation."""
+
+    def test_accepts_common_formats(self):
+        import config as c
+        self.assertEqual(c.parse_amount("100rs"), 100.0)
+        self.assertEqual(c.parse_amount("₹100"), 100.0)
+        self.assertEqual(c.parse_amount("99.50"), 99.5)
+        self.assertEqual(c.parse_amount("1,000.50"), 1000.5)
+        self.assertEqual(c.parse_amount(" 250 "), 250.0)
+        self.assertEqual(c.parse_amount(100), 100.0)
+        self.assertEqual(c.parse_amount(100.5), 100.5)
+
+    def test_rejects_invalid(self):
+        import config as c
+        for bad in (None, "", "   ", "abc", "rs", "0", -5, 0, True, False):
+            self.assertIsNone(c.parse_amount(bad), msg=f"should reject {bad!r}")
+
+    def test_clean_amount_str_normalises(self):
+        import config as c
+        self.assertEqual(c.clean_amount_str("100rs"), "100")
+        self.assertEqual(c.clean_amount_str("99.50"), "99.50")
+        self.assertEqual(c.clean_amount_str("₹1,000"), "1000")
+        self.assertEqual(c.clean_amount_str("abc", default="0"), "0")
+
+# =====================================================================
 # MAIN
 # =====================================================================
 if __name__ == "__main__":
