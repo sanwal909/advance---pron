@@ -60,6 +60,35 @@ def redact_secrets_from_text(text, max_len=500):
     s = re.sub(r"\b\d{6,12}:[A-Za-z0-9_\-]{20,60}\b", "[REDACTED_BOT_TOKEN]", s)
     return s[:max_len]
 
+def parse_amount(value, default=None):
+    """Parse an admin-entered price into a POSITIVE float.
+    Accepts: 100, 100.50, '100', '₹100', '100rs', '1,000.50', ' 99 '.
+    Returns float, or `default` (None) when it cannot be parsed or is <= 0.
+    Used so a stray 'rs'/'₹' can never crash QR generation."""
+    try:
+        if value is None or isinstance(value, bool):
+            return default
+        if isinstance(value, (int, float)):
+            f = float(value)
+            return f if f > 0 else default
+        s = str(value).strip()
+        if not s:
+            return default
+        cleaned = re.sub(r"[^0-9.\-]", "", s)
+        if not cleaned or cleaned in (".", "-", "-.", ".-"):
+            return default
+        f = float(cleaned)
+        return f if f > 0 else default
+    except Exception:
+        return default
+
+def clean_amount_str(value, default="0"):
+    """Return a clean numeric string for storage, e.g. '100rs' -> '100'."""
+    f = parse_amount(value)
+    if f is None:
+        return default
+    return str(int(f)) if float(f).is_integer() else ("%.2f" % f)
+
 # Spam protection settings
 MAX_SPAM_COUNT = int(os.environ.get("MAX_SPAM_COUNT", "5"))
 SPAM_TIME_WINDOW = int(os.environ.get("SPAM_TIME_WINDOW", "10"))
