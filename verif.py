@@ -521,7 +521,7 @@ You'll receive unique join link within few minutes.
                 'user_id': user_id,
                 'plan_type': plan_type,
                 'plan_name': plan['name'],
-                'amount': float(plan['amount']),
+                'amount': config.parse_amount(plan.get('amount'), 0.0),
                 'upi_id': settings.get('upi_id', 'Unknown'),
                 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 'date': datetime.now().strftime("%Y-%m-%d"),
