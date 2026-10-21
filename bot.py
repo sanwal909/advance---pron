@@ -1691,6 +1691,7 @@ def handle_settings(message):
 <b>🧾 Proof Status:</b> {'ON' if settings.get('payment_proof_status', False) else 'OFF'}
 <b>🛡️ Force Join:</b> {'ON' if settings.get('force_join_status', True) else 'OFF'}
 <b>🤖 Auto-Accept:</b> {'ON' if settings.get('auto_accept_requests', False) else 'OFF'}
+<b>🔐 Join-Request Mode:</b> {'ON (admin approve)' if settings.get('join_request_mode', False) else 'OFF (direct link)'}
 
 <b>📞 Support:</b>
 • Username: @{settings.get('support_username', 'Not Set') or 'Not Set'}
@@ -2167,6 +2168,168 @@ def handle_support_toggle(message):
 
     status = "ON" if settings["support_status"] else "OFF"
     bot.reply_to(message, f"✅ Contact Support button is now <b>{status}</b>.", parse_mode="HTML")
+
+# ========== JOIN REQUEST (ADMIN APPROVAL) MODE ==========
+@bot.message_handler(commands=['join_request_toggle', 'approval_toggle'])
+def handle_join_request_toggle(message):
+    """Toggle admin-approval (join-request) mode for post-payment links.
+
+    ON  → user ko approval link milta hai; user request bhejta hai; admin
+          Approve/Decline karta hai, tabhi user channel me add hota hai.
+    OFF → pehle jaisa direct one-time link (member_limit=1) milta hai."""
+    if not is_admin(message.from_user.id):
+        return
+
+    settings['join_request_mode'] = not bool(settings.get('join_request_mode', False))
+    save_settings()
+
+    if settings['join_request_mode']:
+        txt = ("✅ <b>Join-Request Mode: ON</b>\n\n"
+               "Ab payment verify hone ke baad user ko <b>approval link</b> milega.\n"
+               "User link pe click karke <b>join request</b> bhejega → aapko "
+               "<b>✅ Approve / ❌ Decline</b> buttons aayenge → aapke approve karne par hi "
+               "user channel me add hoga.")
+    else:
+        txt = ("✅ <b>Join-Request Mode: OFF</b>\n\n"
+               "Ab payment verify hote hi user ko pehle jaise <b>direct one-time link</b> "
+               "(member_limit=1) milega.")
+    bot.reply_to(message, txt, parse_mode="HTML")
+
+def handle_chat_join_request(request):
+    """User ne approval-link se join request bheja → admins ko Approve/Decline buttons bhejo."""
+    try:
+        chat_id = request.chat.id
+        chat_title = getattr(request.chat, 'title', str(chat_id))
+        user = request.from_user
+        user_id = user.id
+
+        invite_url = ""
+        try:
+            invite_url = request.invite_link.invite_link or ""
+        except Exception:
+            invite_url = ""
+
+        record = {
+            'user_id': str(user_id),
+            'chat_id': str(chat_id),
+            'chat_title': chat_title,
+            'username': getattr(user, 'username', '') or '',
+            'first_name': getattr(user, 'first_name', '') or '',
+            'invite_link': invite_url,
+            'status': 'pending',
+            'time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+        # Track (dedupe by user+chat, keep newest) — mutate the SAME list object
+        # that config holds so persistence stays consistent.
+        jr = config.join_requests
+        if isinstance(jr, list):
+            jr[:] = [r for r in jr if not (
+                isinstance(r, dict)
+                and str(r.get('user_id')) == str(user_id)
+                and str(r.get('chat_id')) == str(chat_id)
+            )]
+            jr.append(record)
+            config.save_join_requests()
+
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("✅ Approve", callback_data=f"jreq_ok_{chat_id}_{user_id}"),
+            types.InlineKeyboardButton("❌ Decline", callback_data=f"jreq_no_{chat_id}_{user_id}")
+        )
+        admin_text = (
+            f"🔔 <b>NEW JOIN REQUEST</b>\n\n"
+            f"👤 {record['first_name'] or 'User'}"
+            f"{' (@' + record['username'] + ')' if record['username'] else ''}\n"
+            f"🆔 <code>{user_id}</code>\n"
+            f"📢 Channel: {chat_title}\n"
+            f"🕒 {record['time']}\n\n"
+            f"<i>Aapke approve karne ke baad user channel me add hoga.</i>"
+        )
+        for admin in settings.get('admin_ids', []):
+            try:
+                bot.send_message(admin, admin_text, reply_markup=kb, parse_mode="HTML")
+            except Exception as e:
+                logging.warning(f"Could not notify admin {admin} about join request: {type(e).__name__}")
+    except Exception as e:
+        logging.error(f"chat_join_request handler error: {e}")
+
+# Register the join-request handler only if this pyTelegramBotAPI build supports it.
+if hasattr(bot, 'chat_join_request_handler'):
+    bot.chat_join_request_handler()(handle_chat_join_request)
+else:
+    logging.warning(
+        "Installed pyTelegramBotAPI does not support chat_join_request — "
+        "join-request mode will not notify admins automatically. Upgrade pyTelegramBotAPI."
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('jreq_ok_') or call.data.startswith('jreq_no_'))
+def handle_join_request_decision(call):
+    """Admin ne Approve/Decline click kiya → request ko approve/decline karo."""
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "❌ Only admins can do this.", show_alert=True)
+        return
+
+    try:
+        action, chat_id_str, user_id_str = call.data.split('_')[1], call.data.split('_')[2], call.data.split('_')[3]
+        chat_id = int(chat_id_str)
+        user_id = int(user_id_str)
+    except Exception:
+        bot.answer_callback_query(call.id, "⚠️ Invalid request data.", show_alert=True)
+        return
+
+    try:
+        if action == 'ok':
+            bot.approve_chat_join_request(chat_id, user_id)
+            status, verdict = 'approved', "✅ <b>APPROVED</b>"
+            user_msg = ("🎉 <b>Request Approved!</b>\n\n"
+                        "Aapko channel me add kar diya gaya hai. Welcome! 🎊")
+        else:
+            bot.decline_chat_join_request(chat_id, user_id)
+            status, verdict = 'declined', "❌ <b>DECLINED</b>"
+            user_msg = ("😔 <b>Request Declined</b>\n\n"
+                        "Aapka join request admin ne decline kar diya.\n"
+                        "Koi dikkat ho to support se contact karein.")
+    except Exception as e:
+        logging.error(f"Join request approve/decline failed: {e}")
+        bot.answer_callback_query(call.id, f"⚠️ Telegram error: {str(e)[:120]}", show_alert=True)
+        return
+
+    # Update stored record
+    try:
+        jr = config.join_requests
+        if isinstance(jr, list):
+            for r in jr:
+                if (isinstance(r, dict)
+                        and str(r.get('user_id')) == str(user_id)
+                        and str(r.get('chat_id')) == str(chat_id)):
+                    r['status'] = status
+                    r['handled_by'] = str(call.from_user.id)
+                    r['handled_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            config.save_join_requests()
+    except Exception as e:
+        logging.error(f"Join request record update failed: {e}")
+
+    # Notify the user
+    try:
+        bot.send_message(user_id, user_msg, parse_mode="HTML")
+    except Exception as e:
+        logging.warning(f"Could not DM user {user_id} about join request: {type(e).__name__}")
+
+    # Mark the admin message
+    try:
+        base = getattr(call.message, 'html_text', None) or call.message.text or ""
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text=f"{base}\n\n{verdict} by admin",
+            parse_mode="HTML",
+            reply_markup=None
+        )
+    except Exception as e:
+        logging.warning(f"Could not edit admin join-request message: {type(e).__name__}")
+
+    bot.answer_callback_query(call.id, "Approved ✅" if action == 'ok' else "Declined ✅")
 
 @bot.message_handler(commands=['set_proof_link'])
 def handle_set_proof_link(message):
@@ -3647,6 +3810,14 @@ Use: <code>/set [key] [value]</code>
 <b>🔹 CONTACT SUPPORT SETTINGS:</b>
 /support_toggle      - Toggle 📞 Contact Support button ON/OFF
 /set support @uname  - Set support username (via /set)
+
+━━━━━━━━━━━━━━━
+<b>🔹 JOIN-REQUEST (ADMIN APPROVAL) MODE:</b>
+/join_request_toggle - ON/OFF karo
+    → <b>ON:</b> payment verify hone par user ko <b>approval link</b> milega,
+      user <b>join request</b> bhejega, aur <b>aap Approve/Decline</b> karenge
+      (tabhi user channel me add hoga)
+    → <b>OFF:</b> pehle jaise <b>direct one-time link</b> (member_limit=1)
 
 ━━━━━━━━━━━━━━━
 <b>🔹 PREMIUM CHANNEL MANAGEMENT:</b>
