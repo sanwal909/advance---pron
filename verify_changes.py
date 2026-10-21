@@ -95,6 +95,7 @@ class TestConfigSettingsMerge(unittest.TestCase):
             "proof_channel_id": "-100proof",
             "payment_proof_status": True,
             "payment_proof_link": "https://t.me/proof",
+            "join_request_mode": False,
             "force_join_status": True,
             "auto_accept_requests": False,
             "backup_channel": "-100bak",
@@ -474,6 +475,44 @@ class TestAmountParsing(unittest.TestCase):
         self.assertEqual(c.clean_amount_str("99.50"), "99.50")
         self.assertEqual(c.clean_amount_str("₹1,000"), "1000")
         self.assertEqual(c.clean_amount_str("abc", default="0"), "0")
+
+class TestJoinRequestMode(unittest.TestCase):
+    """Admin-approval mode: OFF = direct single-use link, ON = creates_join_request."""
+
+    def test_default_is_off(self):
+        import config as c
+        self.assertIn('join_request_mode', c.DEFAULT_SETTINGS)
+        self.assertFalse(c.DEFAULT_SETTINGS['join_request_mode'])
+
+    def test_migration_adds_flag_to_old_settings(self):
+        import config as c
+        s = {"premium_channels": []}
+        c._run_idempotent_migrations(s)
+        self.assertIn('join_request_mode', s)
+        self.assertFalse(s['join_request_mode'])
+
+    def test_off_gives_single_use_direct_link(self):
+        import config as c, verif
+        prev = c.settings.get('join_request_mode', False)
+        try:
+            c.settings['join_request_mode'] = False
+            kw = verif.VerificationSystem._invite_kwargs(object())
+            self.assertEqual(kw.get('member_limit'), 1)
+            self.assertNotIn('creates_join_request', kw)
+        finally:
+            c.settings['join_request_mode'] = prev
+
+    def test_on_gives_approval_link(self):
+        import config as c, verif
+        prev = c.settings.get('join_request_mode', False)
+        try:
+            c.settings['join_request_mode'] = True
+            kw = verif.VerificationSystem._invite_kwargs(object())
+            self.assertTrue(kw.get('creates_join_request'))
+            # Telegram forbids member_limit together with creates_join_request
+            self.assertNotIn('member_limit', kw)
+        finally:
+            c.settings['join_request_mode'] = prev
 
 # =====================================================================
 # MAIN
