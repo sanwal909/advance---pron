@@ -93,9 +93,33 @@ class VerificationSystem:
         # save_json_file(PENDING_VERIF_FILE, self.pending) # Removed for batch saving
         pass
     
+    def _invite_kwargs(self):
+        """Invite-link kwargs for the CURRENT mode.
+        - join_request_mode OFF → single-use direct link (member_limit=1)
+        - join_request_mode ON  → approval link (creates_join_request=True).
+          Telegram does NOT allow member_limit together with creates_join_request."""
+        expire = datetime.now() + timedelta(days=365)
+        if settings.get('join_request_mode', False):
+            return {'expire_date': expire, 'creates_join_request': True}
+        return {'expire_date': expire, 'member_limit': 1}
+
+    def _create_invite(self, chat_id):
+        """Create an invite link respecting the current mode.
+        Falls back to a normal single-use link if the installed pyTelegramBotAPI
+        build does not support creates_join_request."""
+        kwargs = self._invite_kwargs()
+        try:
+            return self.bot.create_chat_invite_link(chat_id=int(chat_id), **kwargs)
+        except TypeError:
+            # Older library: creates_join_request unsupported → normal link
+            return self.bot.create_chat_invite_link(
+                chat_id=int(chat_id), member_limit=1, expire_date=kwargs['expire_date']
+            )
+
     def create_invite_link(self, user_id, plan_type):
         """Create TWO unique invite links per channel for specific plan.
-        Each link has member_limit=1 (single-use) so user gets 2 separate links.
+        Normal mode  : member_limit=1 (single-use) — 2 separate links.
+        Approval mode: creates_join_request=True — har join admin approval ke baad.
         """
         global invite_links
         try:
@@ -110,11 +134,7 @@ class VerificationSystem:
                     if not cid: continue
                     for link_num in range(1, INVITES_PER_CHANNEL + 1):
                         try:
-                            invite = self.bot.create_chat_invite_link(
-                                chat_id=int(cid),
-                                member_limit=1,  # each link = 1 use
-                                expire_date=datetime.now() + timedelta(days=365)
-                            )
+                            invite = self._create_invite(cid)
                             valid_links.append(f"Channel {idx} - Link {link_num}: {invite.invite_link}")
                         except Exception as e:
                             logger.error(f"Error creating invite for {cid} (link #{link_num}): {e}")
@@ -150,11 +170,7 @@ class VerificationSystem:
             valid_links = []
             for link_num in range(1, INVITES_PER_CHANNEL + 1):
                 try:
-                    invite = self.bot.create_chat_invite_link(
-                        chat_id=int(channel_id),
-                        member_limit=1,  # each link = 1 use
-                        expire_date=datetime.now() + timedelta(days=365)
-                    )
+                    invite = self._create_invite(channel_id)
                     valid_links.append(f"Link {link_num}: {invite.invite_link}")
                 except Exception as e:
                     logger.error(f"Error creating invite #{link_num} for {channel_id}: {e}")
@@ -439,6 +455,22 @@ You'll receive unique join link within few minutes.
         
         # Send join link to user
         try:
+            approval_mode = bool(settings.get('join_request_mode', False))
+            if approval_mode:
+                links_heading = "<b>👇 Your Approval Links (join request bhejo):</b>"
+                mode_note = (
+                    "🔐 <b>Admin Approval Required:</b> Link pe click karke <b>join request</b> bhejo.\n"
+                    "   Admin approve karega, uske baad aap channel me add ho jayenge.\n"
+                    "   ⏳ Thoda wait karein — approval me time lag sakta hai."
+                )
+            else:
+                links_heading = "<b>👇 Your Invite Links (2 Links, 1 use each):</b>"
+                mode_note = (
+                    "⚠️ <b>Important:</b> You received <b>2 UNIQUE LINKS</b> — each link works for <b>ONLY 1 PERSON</b>.\n"
+                    "   • <b>Link 1:</b> Join yourself\n"
+                    "   • <b>Link 2:</b> Share with a friend / family (one more person)"
+                )
+
             if plan_type == "demo":
                 join_msg = f"""
 🎉 <b>DEMO ACCESS VERIFIED!</b>
@@ -446,12 +478,10 @@ You'll receive unique join link within few minutes.
 <b>Plan:</b> {plan['name']}
 <b>Amount Paid:</b> ₹{plan['amount']}
 
-<b>👇 Your Invite Links (2 Links, 1 use each):</b>
+{links_heading}
 {invite_link}
 
-⚠️ <b>Note:</b> You got <b>2 SEPARATE LINKS</b> — each link works only <b>1 TIME</b>.
-   • Link 1 → Use for yourself
-   • Link 2 → Share with 1 friend / family
+{mode_note}
 📅 <b>Access Duration:</b> {plan.get('duration', '30 Days')}
 
 <b>Enjoy your demo! 🍿</b>
@@ -463,12 +493,10 @@ You'll receive unique join link within few minutes.
 <b>Plan:</b> {plan['name']}
 <b>Amount Paid:</b> ₹{plan['amount']}
 
-<b>👇 Your Invite Links (2 Links, 1 use each):</b>
+{links_heading}
 {invite_link}
 
-⚠️ <b>Important:</b> You received <b>2 UNIQUE LINKS</b> — each link works for <b>ONLY 1 PERSON</b>.
-   • <b>Link 1:</b> Join yourself
-   • <b>Link 2:</b> Share with a friend / family (one more person)
+{mode_note}
 📅 <b>Access Duration:</b> {plan.get('duration', '30 Days')}
 
 <b>Welcome to Premium Family! 🎊</b>
@@ -482,6 +510,7 @@ You'll receive unique join link within few minutes.
             
             # Log verification
             order_num = pending_data.get('order_number', 'N/A')
+            mode_line = "🔐 Mode: Admin Approval (join request)\n" if approval_mode else ""
             log_msg = f"""
 ✅ <b>PAYMENT VERIFIED (Order #{order_num})</b>
 
@@ -489,7 +518,7 @@ You'll receive unique join link within few minutes.
 📅 Plan: {plan['name']}
 💰 Amount: ₹{plan['amount']}
 👮 Verified By: Admin
-🔗 Invite Link: {invite_link}
+{mode_line}🔗 Invite Link: {invite_link}
 ⏰ Time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
             """
             
