@@ -470,6 +470,7 @@ DEFAULT_SETTINGS = {
     "demo_color": "",
     "payment_proof_link": "",
     "payment_proof_status": True,
+    "join_request_mode": False,
     "support_username": "",
     "support_status": True,
     "how_to_buy_url": "",
@@ -649,6 +650,7 @@ def _run_idempotent_migrations(settings_obj):
     for key, default in (('proof_channel_id', ""), ('payment_proof_status', True),
                          ('payment_proof_link', ""), ('force_join_status', True),
                          ('auto_accept_requests', False), ('backup_channel', ""),
+                         ('join_request_mode', False),
                          ('log_channel', ""), ('demo_channel_link', ""),
                          ('demo_channel_id', ""), ('demo_paid_status', False),
                          ('demo_amount', "10"), ('demo_color', ""),
@@ -746,6 +748,10 @@ def save_spam_data():
 def save_start_message():
     """Save start message"""
     save_json_file(START_MESSAGE_FILE, start_message_data)
+
+def save_join_requests():
+    """Save tracked chat join requests"""
+    save_json_file(JOIN_REQUESTS_FILE, join_requests)
 
 def save_settings():
     """Save settings"""
