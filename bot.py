@@ -3489,6 +3489,27 @@ def handle_clear_start_message(message):
     save_start_message()
     bot.reply_to(message, "✅ Custom start message cleared")
 
+# ========== SAFE LONG-HTML SENDER (never breaks a tag while splitting) ==========
+def _send_long_html(chat_id, text, reply_to_message=None, limit=3800):
+    """Send a possibly-long HTML message, splitting into valid chunks.
+    Falls back to plain text if Telegram still rejects the entities."""
+    chunks = config.split_html_safe(text, limit=limit) or [text]
+    for idx, chunk in enumerate(chunks):
+        try:
+            if reply_to_message is not None and idx == 0:
+                bot.reply_to(reply_to_message, chunk, parse_mode="HTML")
+            else:
+                bot.send_message(chat_id, chunk, parse_mode="HTML")
+        except Exception as e:
+            logging.error(f"_send_long_html failed (chunk {idx + 1}/{len(chunks)}): {e}")
+            try:
+                if reply_to_message is not None and idx == 0:
+                    bot.reply_to(reply_to_message, chunk)
+                else:
+                    bot.send_message(chat_id, chunk)
+            except Exception as e2:
+                logging.error(f"_send_long_html plain retry failed: {e2}")
+
 # ========== /PENDING COMMAND ==========
 @bot.message_handler(commands=['pending'])
 def handle_pending(message):
@@ -3512,13 +3533,7 @@ def handle_pending(message):
         text += f"📸 Screenshot: {'✅' if 'screenshot_file_id' in data else '❌'}\n"
         text += "───────────────\n"
     
-    # Split if too long
-    if len(text) > 4000:
-        parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
-        for part in parts:
-            bot.send_message(message.chat.id, part, parse_mode="HTML")
-    else:
-        bot.reply_to(message, text, parse_mode="HTML")
+    _send_long_html(message.chat.id, text, reply_to_message=message)
 
 # ========== /CLEAR_ALL_PAYMENTS COMMAND ==========
 @bot.message_handler(commands=['clear_all_payments'])
@@ -3743,13 +3758,7 @@ def handle_help(message):
 • If pending = screenshot uploaded → wait for admin OR use /cancel_order
 • For any issue click <b>📞 Contact Support</b> button
         """
-        # Split if too long
-        if len(user_help) > 4000:
-            parts = [user_help[i:i+4000] for i in range(0, len(user_help), 4000)]
-            for part in parts:
-                bot.send_message(message.chat.id, part, parse_mode="HTML")
-        else:
-            bot.reply_to(message, user_help, parse_mode="HTML")
+        _send_long_html(message.chat.id, user_help, reply_to_message=message)
         return
 
     # ========== ADMIN HELP (ALL commands) ==========
@@ -3926,13 +3935,7 @@ All other buttons (Buy Now, Back, Payment Done, etc.) automatically get random c
 5. <code>/settings</code> - Verify everything
     """
 
-    # Split if too long (Telegram limit ~4096)
-    if len(admin_help) > 4000:
-        parts = [admin_help[i:i+4000] for i in range(0, len(admin_help), 4000)]
-        for part in parts:
-            bot.send_message(message.chat.id, part, parse_mode="HTML")
-    else:
-        bot.reply_to(message, admin_help, parse_mode="HTML")
+    _send_long_html(message.chat.id, admin_help, reply_to_message=message)
 
 # ========== SILENT HANDLER ==========
 @bot.message_handler(func=lambda message: True)
