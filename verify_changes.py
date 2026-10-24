@@ -514,6 +514,52 @@ class TestJoinRequestMode(unittest.TestCase):
         finally:
             c.settings['join_request_mode'] = prev
 
+class TestHtmlSplitting(unittest.TestCase):
+    """Long HTML messages must split WITHOUT ever breaking a tag (Telegram parse errors)."""
+
+    _TAG = re.compile(r'<[^<>]*>')
+
+    def _assert_chunks_valid(self, chunks):
+        for ch in chunks:
+            # No partial tags: after removing complete tags nothing like < or > remains
+            leftover = self._TAG.sub('', ch)
+            self.assertNotIn('<', leftover, f"Broken tag start in chunk: {ch[-80:]!r}")
+            self.assertNotIn('>', leftover, f"Broken tag end in chunk: {ch[-80:]!r}")
+            # Balanced <b> ... </b> etc.
+            opens = len(re.findall(r'<([a-zA-Z][a-zA-Z0-9]*)(\s[^<>]*)?>', ch))
+            closes = len(re.findall(r'</[a-zA-Z][a-zA-Z0-9]*>', ch))
+            self.assertEqual(opens, closes, f"Unbalanced tags in chunk: {ch[:80]!r}")
+
+    def test_short_text_is_single_chunk(self):
+        import config as c
+        chunks = c.split_html_safe("<b>Hello</b>\n<i>World</i>")
+        self.assertEqual(len(chunks), 1)
+        self._assert_chunks_valid(chunks)
+
+    def test_every_chunk_within_limit(self):
+        import config as c
+        text = "\n".join(f"<b>Line {i}</b> some text here" for i in range(500))
+        chunks = c.split_html_safe(text, limit=500)
+        self.assertGreater(len(chunks), 1)
+        for ch in chunks:
+            self.assertLessEqual(len(ch), 500)
+        self._assert_chunks_valid(chunks)
+
+    def test_no_tag_split_even_at_tight_limit(self):
+        import config as c
+        # A line with a tag force-split risk under tiny limits
+        text = "\n".join(f"<code>{i}</code> <b>x</b>" for i in range(50))
+        chunks = c.split_html_safe(text, limit=40)
+        self._assert_chunks_valid(chunks)
+
+    def test_total_visible_content_preserved(self):
+        import config as c
+        text = "\n".join(f"<b>Row {i}</b>: value {i}" for i in range(200))
+        chunks = c.split_html_safe(text, limit=300)
+        joined = "\n".join(self._TAG.sub('', ch) for ch in chunks)
+        for i in range(200):
+            self.assertIn(f"Row {i}: value {i}", joined)
+
 # =====================================================================
 # MAIN
 # =====================================================================
