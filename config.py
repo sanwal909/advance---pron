@@ -89,6 +89,59 @@ def clean_amount_str(value, default="0"):
         return default
     return str(int(f)) if float(f).is_integer() else ("%.2f" % f)
 
+# Matches a single complete HTML tag (with optional quoted attributes).
+_HTML_TAG_RE = re.compile(r'<(/?)([a-zA-Z][a-zA-Z0-9]*)((?:"[^"]*"|\'[^\']*\'|[^<>])*?)(/?)>')
+
+def split_html_safe(text, limit=3800):
+    """Split an HTML string into chunks each <= limit chars WITHOUT ever breaking a tag.
+
+    Splitting is done on line boundaries; any tag left open at a chunk boundary is
+    closed at the end of that chunk and reopened at the start of the next one, so
+    every chunk is always valid HTML (Telegram 'can't parse entities' safe)."""
+    chunks = []
+    cur_lines = []
+    cur_len = 0
+    open_tags = []  # e.g. ['b', 'a href="x"']
+
+    def _reopen_prefix():
+        return ''.join(f'<{t}>' for t in open_tags)
+
+    def _close_suffix():
+        return ''.join(f'</{t.split()[0].split("=")[0]}>' for t in reversed(open_tags))
+
+    def _flush():
+        nonlocal cur_lines, cur_len
+        if not cur_lines:
+            return
+        chunks.append('\n'.join(cur_lines) + _close_suffix())
+        cur_lines = []
+        cur_len = 0
+
+    for line in text.split('\n'):
+        prefix = _reopen_prefix()
+        if cur_lines and cur_len + len(prefix) + len(line) + 1 > limit:
+            _flush()
+            prefix = _reopen_prefix()
+        cur_lines.append(prefix + line)
+        cur_len += len(prefix) + len(line) + 1
+
+        for m in _HTML_TAG_RE.finditer(line):
+            is_close = m.group(1) == '/'
+            name = m.group(2).lower()
+            attrs = m.group(3) or ''
+            self_close = m.group(4) == '/'
+            if name == 'br':
+                continue
+            if is_close:
+                for i in range(len(open_tags) - 1, -1, -1):
+                    if open_tags[i].split()[0].split('=')[0] == name:
+                        del open_tags[i]
+                        break
+            elif not self_close:
+                open_tags.append((name + attrs).strip())
+    _flush()
+    return chunks
+
 # Spam protection settings
 MAX_SPAM_COUNT = int(os.environ.get("MAX_SPAM_COUNT", "5"))
 SPAM_TIME_WINDOW = int(os.environ.get("SPAM_TIME_WINDOW", "10"))
