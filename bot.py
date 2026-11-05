@@ -2484,33 +2484,6 @@ def handle_admin_callbacks(call):
         msg = bot.send_message(call.message.chat.id, "Enter New Demo Channel ID:")
         bot.register_next_step_handler(msg, lambda m: update_setting(m, 'demo_channel_id', "Demo ID"))
 
-    elif data == "chan_list_edit":
-        kb = types.InlineKeyboardMarkup(row_width=1)
-        for ch in settings.get('premium_channels', []):
-            kb.add(types.InlineKeyboardButton(f"📝 Edit {ch['name']}", callback_data=f"chan_edit_{ch['id']}"))
-        kb.add(types.InlineKeyboardButton("⬅️ Back", callback_data="admin_channels"))
-        bot.edit_message_text("Select channel to EDIT:", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb)
-
-    elif data.startswith("chan_edit_"):
-        chan_id = call.data.replace("chan_edit_", "")
-        kb = types.InlineKeyboardMarkup(row_width=2)
-        kb.add(
-            types.InlineKeyboardButton("📝 Name", callback_data=f"cedit_{chan_id}_name"),
-            types.InlineKeyboardButton("💰 Price", callback_data=f"cedit_{chan_id}_amount"),
-            types.InlineKeyboardButton("🆔 ID", callback_data=f"cedit_{chan_id}_channel_id"),
-            types.InlineKeyboardButton("⏰ Time", callback_data=f"cedit_{chan_id}_duration"),
-            types.InlineKeyboardButton("⬅️ Back", callback_data="chan_list_edit")
-        )
-        bot.edit_message_text("Select field to edit (Colors are now Auto-Random):", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb)
-
-    elif data.startswith("cedit_"):
-        parts = data.split('_')
-        chan_id = parts[1]
-        field = parts[2]
-        
-        msg = bot.send_message(call.message.chat.id, f"Enter New {field.capitalize()}:")
-        bot.register_next_step_handler(msg, process_chan_edit, chan_id, field)
-
     bot.answer_callback_query(call.id)
 
 def process_chan_edit(message, chan_id, field):
@@ -2653,29 +2626,229 @@ def handle_pay2_proxy(message):
     )
 
 # ========== CHANNEL MANAGEMENT FLOWS ==========
-@bot.callback_query_handler(func=lambda call: call.data.startswith('chan_'))
+@bot.callback_query_handler(func=lambda call: call.data.startswith('chan_') or call.data.startswith('cedit_'))
 def handle_channel_callbacks(call):
     if not is_admin(call.from_user.id): return
-    
-    if call.data == "chan_add":
+    data = call.data
+
+    if data == "chan_add":
         msg = bot.send_message(call.message.chat.id, "<b>➕ Add New Channel</b>\n\nEnter Channel Name (e.g. <i>Premium VIP</i>):", parse_mode="HTML")
         bot.register_next_step_handler(msg, process_chan_name)
-    
-    elif call.data == "chan_list_del":
+
+    elif data == "chan_list_del":
         kb = types.InlineKeyboardMarkup(row_width=1)
         for ch in settings.get('premium_channels', []):
             kb.add(types.InlineKeyboardButton(f"❌ Delete {ch['name']}", callback_data=f"chan_del_{ch['id']}"))
         kb.add(types.InlineKeyboardButton("⬅️ Back", callback_data="admin_channels"))
         bot.edit_message_text("Select channel to DELETE:", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb)
 
-    elif call.data.startswith("chan_del_"):
-        chan_id = call.data.replace("chan_del_", "")
+    elif data.startswith("chan_del_"):
+        chan_id = data.replace("chan_del_", "")
         settings['premium_channels'] = [ch for ch in settings.get('premium_channels', []) if ch['id'] != chan_id]
         save_settings()
         bot.answer_callback_query(call.id, "✅ Channel Deleted")
         handle_admin_callbacks(types.CallbackQuery(id='0', from_user=call.from_user, chat_instance='0', message=call.message, data='admin_channels', json_string='{}'))
+        return
+
+    elif data == "chan_list_edit":
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        for ch in settings.get('premium_channels', []):
+            kb.add(types.InlineKeyboardButton(f"📝 Edit {ch['name']}", callback_data=f"chan_edit_{ch['id']}"))
+        kb.add(types.InlineKeyboardButton("⬅️ Back", callback_data="admin_channels"))
+        bot.edit_message_text("Select channel to EDIT:", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb)
+
+    elif data.startswith("chan_edit_"):
+        chan_id = data[len("chan_edit_"):]
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("📝 Name", callback_data=f"cedit_{chan_id}_name"),
+            types.InlineKeyboardButton("💰 Price", callback_data=f"cedit_{chan_id}_amount"),
+            types.InlineKeyboardButton("🆔 ID", callback_data=f"cedit_{chan_id}_channel_id"),
+            types.InlineKeyboardButton("⏰ Time", callback_data=f"cedit_{chan_id}_duration"),
+            types.InlineKeyboardButton("🎬 Demo / 📝 Desc", callback_data=f"cedit_{chan_id}_demo", color="positive"),
+            types.InlineKeyboardButton("⬅️ Back", callback_data="chan_list_edit")
+        )
+        bot.edit_message_text("Select field to edit (Colors are now Auto-Random):", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb)
+
+    elif data.startswith("cedit_"):
+        body = data[len("cedit_"):]
+        # chan_id khud underscore rakh sakta hai (e.g. ch_1234), isliye field ko
+        # known-suffix se match karo — warna 'channel_id' tut jaata hai.
+        chan_id, field = None, None
+        for f in ("channel_id", "duration", "amount", "name", "demo"):
+            if body.endswith("_" + f):
+                field = f
+                chan_id = body[:-(len(f) + 1)]
+                break
+        if not chan_id or not field:
+            bot.answer_callback_query(call.id, "⚠️ Invalid request", show_alert=True)
+            return
+        if field == "demo":
+            _safe_edit_text(call.message.chat.id, call.message.message_id,
+                            chan_demo_menu_text(chan_id), chan_demo_menu_keyboard(chan_id))
+        else:
+            msg = bot.send_message(call.message.chat.id, f"Enter New {field.capitalize()}:")
+            bot.register_next_step_handler(msg, process_chan_edit, chan_id, field)
+
+    elif data.startswith("chan_demo_"):
+        body = data[len("chan_demo_"):]
+        action, chan_id = None, None
+        for a in ("clearok", "clear", "menu", "add", "desc", "view", "done"):
+            if body.startswith(a + "_"):
+                action = a
+                chan_id = body[len(a) + 1:]
+                break
+        if not action or not chan_id:
+            bot.answer_callback_query(call.id, "⚠️ Channel not found", show_alert=True)
+            return
+        if action == "menu":
+            _safe_edit_text(call.message.chat.id, call.message.message_id,
+                            chan_demo_menu_text(chan_id), chan_demo_menu_keyboard(chan_id))
+        elif action == "add":
+            try:
+                bot.delete_message(call.message.chat.id, call.message.message_id)
+            except Exception:
+                pass
+            msg = bot.send_message(
+                call.message.chat.id,
+                "<b>🎬 Add Multiple Media</b>\n\nEk-ek karke video/photo bhejein — sab is channel ke demo me add honge.\nJab poora ho jaye to <b>✅ Done</b> dabayein.\n\n<i>Caption/text bhi bhej sakte hain.</i>",
+                reply_markup=chan_demo_done_keyboard(chan_id),
+                parse_mode="HTML"
+            )
+            bot.register_next_step_handler(msg, chan_demo_capture, chan_id)
+        elif action == "desc":
+            try:
+                bot.delete_message(call.message.chat.id, call.message.message_id)
+            except Exception:
+                pass
+            msg = bot.send_message(call.message.chat.id, "<b>📝 Set Description</b>\n\nDemo ke saath jo description/caption dikhega wo bhejein:", parse_mode="HTML")
+            bot.register_next_step_handler(msg, chan_demo_desc_set, chan_id)
+        elif action == "view":
+            items = chan_demo_items(chan_id)
+            if not items:
+                bot.answer_callback_query(call.id, "Koi demo media nahi hai.", show_alert=True)
+                return
+            send_demo_videos(call.message.chat.id, items, caption=settings.get('plan_demo_descs', {}).get(chan_id, ""))
+        elif action == "clear":
+            kb = types.InlineKeyboardMarkup()
+            kb.add(
+                types.InlineKeyboardButton("✅ Yes, Clear", callback_data=f"chan_demo_clearok_{chan_id}", color="negative"),
+                types.InlineKeyboardButton("❌ Cancel", callback_data=f"chan_demo_menu_{chan_id}")
+            )
+            _safe_edit_text(call.message.chat.id, call.message.message_id,
+                            "⚠️ <b>Clear all demo media & description</b> for this channel?", kb)
+        elif action == "clearok":
+            for it in list(chan_demo_items(chan_id)):
+                if isinstance(it, dict) and it.get('media_id'):
+                    _media_cache_delete_safe(it.get('media_id'))
+            settings.get('plan_demo_videos', {}).pop(chan_id, None)
+            settings.get('plan_demo_descs', {}).pop(chan_id, None)
+            save_settings()
+            _safe_edit_text(call.message.chat.id, call.message.message_id,
+                            chan_demo_menu_text(chan_id), chan_demo_menu_keyboard(chan_id))
+        elif action == "done":
+            try:
+                bot.clear_step_handler_by_chat_id(call.message.chat.id)
+            except Exception:
+                pass
+            try:
+                bot.delete_message(call.message.chat.id, call.message.message_id)
+            except Exception:
+                pass
+            chan_demo_finish(call.message.chat.id, chan_id)
+            return
 
     bot.answer_callback_query(call.id)
+
+
+# ---------- Per-channel demo (multiple media + description) ----------
+def chan_demo_items(chan_id):
+    return settings.get('plan_demo_videos', {}).get(chan_id, [])
+
+def chan_demo_menu_text(chan_id):
+    ch = next((c for c in settings.get('premium_channels', []) if c['id'] == chan_id), None)
+    name = ch.get('name', chan_id) if ch else chan_id
+    items = chan_demo_items(chan_id)
+    media_n = sum(1 for i in items if isinstance(i, dict) and i.get('type') != 'text')
+    text_n = sum(1 for i in items if isinstance(i, dict) and i.get('type') == 'text')
+    desc = settings.get('plan_demo_descs', {}).get(chan_id, "")
+    return (f"<b>🎬 DEMO / DESC — {name}</b>\n"
+            f"<b>Channel ID:</b> <code>{chan_id}</code>\n\n"
+            f"<b>🎞 Media items:</b> {media_n}\n"
+            f"<b>📄 Text items:</b> {text_n}\n"
+            f"<b>📝 Description:</b> {desc or '<i>Not set</i>'}\n\n"
+            f"<i>Yeh demo user ko is channel ko kholte waqt dikhega.</i>")
+
+def chan_demo_menu_keyboard(chan_id):
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("➕ Add Multiple Media", callback_data=f"chan_demo_add_{chan_id}", color="positive"),
+        types.InlineKeyboardButton("📝 Set Description", callback_data=f"chan_demo_desc_{chan_id}", color="primary"),
+        types.InlineKeyboardButton("👁 Preview Demo", callback_data=f"chan_demo_view_{chan_id}", color="primary"),
+        types.InlineKeyboardButton("🗑 Clear Demo", callback_data=f"chan_demo_clear_{chan_id}", color="negative"),
+        types.InlineKeyboardButton("⬅️ Back", callback_data=f"chan_edit_{chan_id}")
+    )
+    return kb
+
+def chan_demo_done_keyboard(chan_id):
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("✅ Done", callback_data=f"chan_demo_done_{chan_id}", color="positive"))
+    return kb
+
+def chan_demo_capture(message, chan_id):
+    """Multi-media add loop: har media/text is channel ke demo me append karo, phir agla wait karo."""
+    if not is_admin(message.from_user.id):
+        return
+    chat_id = message.chat.id
+    txt = (message.text or "").strip().lower()
+    if txt in ("/done", "done", "/finish"):
+        chan_demo_finish(chat_id, chan_id)
+        return
+
+    fid, ftype = _message_media_file_id(message)
+    item = None
+    if fid:
+        if ftype == 'document':
+            mime = (message.document.mime_type or "") if message.document else ""
+            ftype = 'photo' if 'image' in mime else 'video'
+        item = {"id": fid, "type": ftype}
+    elif message.text:
+        item = {"type": "text", "text": message.text}
+
+    if not item:
+        msg = bot.send_message(chat_id, "⚠️ Video/photo/text bhejein, ya <b>✅ Done</b> dabayein.",
+                               reply_markup=chan_demo_done_keyboard(chan_id), parse_mode="HTML")
+        bot.register_next_step_handler(msg, chan_demo_capture, chan_id)
+        return
+
+    if item.get('type') != 'text':
+        mid = _cache_file_id(fid, item['type'])
+        if mid:
+            item['media_id'] = mid
+
+    lst = settings.setdefault('plan_demo_videos', {}).setdefault(chan_id, [])
+    lst.append(item)
+    save_settings()
+    msg = bot.send_message(chat_id,
+                           f"✅ Added <b>{item.get('type')}</b> — Total: <b>{len(lst)}</b>\n\nAur bhejein, ya <b>✅ Done</b> dabayein.",
+                           reply_markup=chan_demo_done_keyboard(chan_id), parse_mode="HTML")
+    bot.register_next_step_handler(msg, chan_demo_capture, chan_id)
+
+def chan_demo_desc_set(message, chan_id):
+    if not is_admin(message.from_user.id):
+        return
+    desc = (message.text or "").strip()
+    settings.setdefault('plan_demo_descs', {})[chan_id] = desc
+    save_settings()
+    bot.send_message(message.chat.id, "✅ Description updated.", parse_mode="HTML")
+    bot.send_message(message.chat.id, chan_demo_menu_text(chan_id),
+                     reply_markup=chan_demo_menu_keyboard(chan_id), parse_mode="HTML")
+
+def chan_demo_finish(chat_id, chan_id):
+    n = len(chan_demo_items(chan_id))
+    bot.send_message(chat_id, f"✅ <b>Done!</b> Total <b>{n}</b> demo item(s) saved.", parse_mode="HTML")
+    bot.send_message(chat_id, chan_demo_menu_text(chan_id),
+                     reply_markup=chan_demo_menu_keyboard(chan_id), parse_mode="HTML")
 
 def process_chan_name(message):
     name = message.text.strip()
