@@ -23,6 +23,13 @@ UPI_ID = os.getenv("UPI_ID", "").strip('"')
 UPI_NAME = os.getenv("UPI_NAME", "").strip('"')
 MONGO_URI = os.getenv("MONGO_URI", "").strip('"')
 
+# Per-bot MongoDB database (namespace) inside the shared cluster.
+# Two bots that share the SAME cluster/MONGO_URI MUST set different DB_NAME values,
+# otherwise they read/write the same data and each other's changes show up everywhere.
+# Default "PremiumBot" keeps full backward compatibility for existing deployments.
+_raw_db_name = os.getenv("DB_NAME", "").strip('"').strip("'").strip()
+DB_NAME = re.sub(r'[\\/."$*<>:|?\s]', "_", _raw_db_name) or "PremiumBot"
+
 # ============ SAFE LOGGING HELPERS ============
 # NEVER log secrets
 _SENSITIVE_KEYS = {"token", "password", "secret", "api_key", "uri", "credentials", "private_key"}
@@ -207,7 +214,7 @@ def _connect_mongodb():
         startup_status["mongo_attempts"] = attempt
         try:
             client = MongoClient(safe_uri, serverSelectionTimeoutMS=5000, connectTimeoutMS=10000)
-            db = client['PremiumBot']
+            db = client[DB_NAME]
             # Immediately test
             client.admin.command('ping')
             startup_status["mongo_connected"] = True
@@ -322,8 +329,14 @@ def force_migrate_to_mongodb():
     return True, migrated
 
 # ============ DATA DIRECTORY ============
+# Each bot namespace (DB_NAME) gets its own local data folder so two bots that share
+# the same cluster — or even the same host folder — never collide on local JSON files.
+# The default bot ("PremiumBot") keeps the legacy 'data/' path for backward compatibility.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+if DB_NAME and DB_NAME != "PremiumBot":
+    DATA_DIR = os.path.join(BASE_DIR, "data", DB_NAME)
+else:
+    DATA_DIR = os.path.join(BASE_DIR, "data")
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR, exist_ok=True)
     print(f"✅ Created data directory: {DATA_DIR}")
@@ -341,7 +354,7 @@ SALES_DATA_FILE = os.path.join(DATA_DIR, "sales_data.json")
 # ============ MEDIA CACHE (token-change safe) ============
 # Telegram file_id is BOT-SPECIFIC: media uploaded to the OLD bot cannot be sent
 # by a NEW bot. To survive a BOT_TOKEN change we ALSO store the actual file bytes
-# (GridFS inside the existing 'PremiumBot' DB; local disk as mirror) so the new bot
+# (GridFS inside this bot's DB; local disk as mirror) so the new bot
 # can re-upload them and obtain a fresh, valid file_id automatically.
 MEDIA_DIR = os.path.join(DATA_DIR, "media")
 try:
@@ -517,6 +530,13 @@ DEFAULT_SETTINGS = {
     "demo_channel_link": DEMO_CHANNEL_LINK,
     "upi_id": UPI_ID,
     "upi_name": UPI_NAME,
+    # Payment mode: "manual" = UPI/QR + screenshot, "pay2" = In666 auto-pay link
+    "payment_gateway": "manual",
+    # Auto-pay (pay2.py) accounts: [{"phone": "+91-XXXXXXXXXX", "password": "..."}]
+    "pay2_accounts": [],
+    # Auto-pay proxy override (bot panel se). "" = env/default use karo,
+    # "off" = proxy disable, warna pura proxy URL.
+    "pay2_proxy": "",
     "demo_channel_id": "",
     "demo_paid_status": False,
     "demo_amount": "10",
@@ -710,6 +730,8 @@ def _run_idempotent_migrations(settings_obj):
                          ('support_username', ""), ('support_status', True),
                          ('how_to_buy_url', ""), ('total_orders', 0),
                          ('upi_id', ""), ('upi_name', ""),
+                         ('payment_gateway', 'manual'), ('pay2_accounts', []),
+                         ('pay2_proxy', ''),
                          ('start_demo_videos', []), ('plan_demo_videos', {}),
                          ('start_demo_desc', ""), ('plan_demo_descs', {})):
         if key not in settings_obj:
@@ -824,6 +846,127 @@ def save_all_data():
     save_json_file(JOIN_REQUESTS_FILE, join_requests)
     save_json_file(SALES_DATA_FILE, sales_data)
     print("💾 All data saved")
+
+# ============ CONFIG CLONE (between bots in the SAME cluster) ============
+# Config collections are safe to copy from one bot's DB to another (the "template").
+CLONE_CONFIG_COLLECTIONS = ["settings", "start_message"]
+
+# USER / transaction collections — NEVER cloned, so each bot keeps its own users,
+# sales, verifications, join requests and invite links.
+CLONE_EXCLUDED_COLLECTIONS = [
+    "users_data", "spam_data", "pending_verifications",
+    "invite_links", "join_requests", "sales_data",
+]
+
+def _clone_media_from(src_db):
+    """Copy all cached media blobs + metadata from the source DB into THIS bot's DB.
+    Telegram file_ids are bot-specific, but the raw BYTES are not, so copying them lets
+    the new bot re-upload demos and get its own valid file_ids. Returns count copied."""
+    copied = 0
+    meta = {}
+    try:
+        for d in src_db["media_cache"].find({}):
+            mid = d.get("_id")
+            if not mid:
+                continue
+            d = dict(d)
+            d.pop("_id", None)
+            meta[mid] = d
+    except Exception as e:
+        logging.warning(f"clone media: metadata read failed: {type(e).__name__}")
+
+    src_bucket = None
+    try:
+        import gridfs
+        src_bucket = gridfs.GridFS(src_db, collection="media_files")
+    except Exception:
+        src_bucket = None
+
+    ids = set(meta.keys())
+    if src_bucket is not None:
+        try:
+            for name in src_bucket.list():
+                ids.add(name)
+        except Exception:
+            pass
+
+    for mid in ids:
+        data = None
+        if src_bucket is not None:
+            try:
+                gf = src_bucket.get(mid)
+                if gf is not None:
+                    data = gf.read()
+            except Exception:
+                data = None
+        if not data:
+            continue
+        m = meta.get(mid, {})
+        if media_cache_save(mid, data, m.get("type", ""), m.get("filename", ""), m.get("mime", "")):
+            copied += 1
+    return copied
+
+def clone_config_from(source_db_name, include_media=True):
+    """Clone CONFIG (settings + start message) and cached media bytes from another DB in
+    the SAME cluster into THIS bot's DB (DB_NAME). USER data is never copied.
+
+    Returns (ok: bool, summary: dict, message: str). Never raises."""
+    summary = {"source_db": (source_db_name or "").strip(), "target_db": DB_NAME,
+               "settings": 0, "start_message": 0, "media": 0}
+    if db is None or client is None:
+        return False, summary, "MongoDB not connected — cannot clone."
+    src_name = (source_db_name or "").strip()
+    if not src_name:
+        return False, summary, "Source DB name is missing."
+    if src_name == DB_NAME:
+        return False, summary, f"Source and target DB are the same ('{DB_NAME}'). Nothing to clone."
+
+    try:
+        client.admin.command('ping')
+    except Exception:
+        return False, summary, "MongoDB connection lost — try again."
+
+    src_db = client[src_name]
+
+    # 1. Copy config collections (each stored as a single 'main_data' document)
+    for col_name in CLONE_CONFIG_COLLECTIONS:
+        try:
+            doc = src_db[col_name].find_one({"_id": "main_data"})
+        except Exception as e:
+            logging.warning(f"clone: read {col_name} failed: {type(e).__name__}")
+            doc = None
+        if doc and doc.get("data") and db_save(col_name, doc["data"]):
+            summary[col_name] = 1
+
+    # 2. Copy cached media bytes so demos keep working on the new bot
+    if include_media:
+        try:
+            summary["media"] = _clone_media_from(src_db)
+        except Exception as e:
+            logging.warning(f"clone media failed: {type(e).__name__}")
+
+    ok = summary["settings"] == 1 or summary["start_message"] == 1
+    message = (f"Source '{src_name}' → target '{DB_NAME}' | settings={summary['settings']}, "
+               f"start_message={summary['start_message']}, media_files={summary['media']}.")
+    return ok, summary, message
+
+def refresh_in_memory_data():
+    """Reload settings + start message from DB/JSON into the LIVE module globals IN PLACE,
+    so bot.py's already-imported references stay valid. Call after a successful clone."""
+    global settings, start_message_data, PLANS
+
+    fresh_settings = load_json_file(SETTINGS_FILE, {})
+    _deep_merge_settings(fresh_settings, DEFAULT_SETTINGS)
+    _run_idempotent_migrations(fresh_settings)
+    settings.clear()
+    settings.update(fresh_settings)
+
+    fresh_sm = load_json_file(START_MESSAGE_FILE, {})
+    start_message_data.clear()
+    start_message_data.update(fresh_sm)
+
+    PLANS = get_plans()
+    return True
 
 # Initialize spam data for existing users
 def initialize_spam_data():
