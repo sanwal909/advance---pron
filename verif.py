@@ -12,17 +12,26 @@ from config import *
 
 logger = logging.getLogger(__name__)
 
-# ========== BUTTON COLOR FIX (to_dict patch - same in bot.py) ==========
+# ========== BUTTON COLOR FIX (API 7.0+ support) ==========
+_original_ikb_init_verif = types.InlineKeyboardButton.__init__
+def _patched_ikb_init_verif(self, *args, **kwargs):
+    color = kwargs.pop('color', None)
+    btn_color = kwargs.pop('button_color', None)
+    _original_ikb_init_verif(self, *args, **kwargs)
+    if color: self.color = color
+    if btn_color: self.button_color = btn_color
+types.InlineKeyboardButton.__init__ = _patched_ikb_init_verif
+
 _original_ikb_to_dict_verif = types.InlineKeyboardButton.to_dict
 def _patched_ikb_to_dict_verif(self):
     json_dict = _original_ikb_to_dict_verif(self)
-    extra_color = getattr(self, 'button_color', None)
-    if extra_color is not None:
-        json_dict['color'] = extra_color
-    if not json_dict.get('color'):
-        extra_color2 = getattr(self, 'color', None)
-        if extra_color2 is not None:
-            json_dict['color'] = extra_color2
+    # Add button color if set (API 7.0+: primary, positive, negative)
+    color = getattr(self, 'button_color', None) or getattr(self, 'color', None)
+    if color:
+        # Resolve common names (blue -> primary, etc)
+        resolved = resolve_color(color)
+        if resolved in ["primary", "positive", "negative"]:
+            json_dict['color'] = resolved
     return json_dict
 types.InlineKeyboardButton.to_dict = _patched_ikb_to_dict_verif
 
