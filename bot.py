@@ -110,20 +110,31 @@ del _token_fmt_ok, _re, _attempt, _bot_token_retry, _bot_token_retry_wait
 # NOTE: Keep `_token` local to the module; the `bot` instance is the handle.
 # We intentionally do NOT log/print the actual token anywhere.
 
-# ========== BUTTON COLOR FIX (to_dict patch for Telegram Bot API Mini Apps colors) ==========
-# pyTelegramBotAPI doesn't include button_color in to_dict() by default
+# ========== BUTTON COLOR FIX (API 7.0+ support) ==========
+_original_ikb_init = types.InlineKeyboardButton.__init__
+def _patched_ikb_init(self, *args, **kwargs):
+    # Extract color-related fields from kwargs before calling original init
+    color = kwargs.pop('color', None)
+    btn_color = kwargs.pop('button_color', None)
+    _original_ikb_init(self, *args, **kwargs)
+    # Store them manually since the original init ignores unknown kwargs
+    if color: self.color = color
+    if btn_color: self.button_color = btn_color
+
+types.InlineKeyboardButton.__init__ = _patched_ikb_init
+
 _original_ikb_to_dict = types.InlineKeyboardButton.to_dict
 def _patched_ikb_to_dict(self):
     json_dict = _original_ikb_to_dict(self)
-    # Add button_color if set (supports: primary, positive, negative, default=None)
-    extra_color = getattr(self, 'button_color', None)
-    if extra_color is not None:
-        json_dict['color'] = extra_color
-    # Also try alternate name for compatibility
-    if not json_dict.get('color'):
-        extra_color2 = getattr(self, 'color', None)
-        if extra_color2 is not None:
-            json_dict['color'] = extra_color2
+    # Add color field for Telegram API 7.0+
+    color = getattr(self, 'button_color', None) or getattr(self, 'color', None)
+    if color:
+        # Resolve common names (blue -> primary, etc)
+        resolved = color
+        if 'verif' in globals() and hasattr(verif, 'resolve_color'):
+            resolved = verif.resolve_color(color)
+        if resolved in ["primary", "positive", "negative"]:
+            json_dict['color'] = resolved
     return json_dict
 types.InlineKeyboardButton.to_dict = _patched_ikb_to_dict
 
@@ -1661,6 +1672,352 @@ Order successfully cancel ho gaya. Naya order create karne ke liye /start use ka
     bot.reply_to(message, user_msg, parse_mode="HTML")
 
 # ========== /SETTINGS COMMAND (FIXED HTML) ==========
+# ========== ADMIN PANEL (Button Based) ==========
+def admin_menu_keyboard():
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    
+    # Row 1: Content Management
+    keyboard.add(
+        types.InlineKeyboardButton("📺 Manage Channels", callback_data="admin_channels", color="primary"),
+        types.InlineKeyboardButton("🎥 Demo Settings", callback_data="admin_demo", color="primary")
+    )
+    
+    # Row 2: Finance/Settings
+    keyboard.add(
+        types.InlineKeyboardButton("💰 UPI & Payment", callback_data="admin_upi", color="positive"),
+        types.InlineKeyboardButton("📊 Stats & Sales", callback_data="admin_stats", color="positive")
+    )
+    
+    # Row 3: Admin & Modes
+    keyboard.add(
+        types.InlineKeyboardButton("👑 Admin Mgmt", callback_data="admin_users", color="negative"),
+        types.InlineKeyboardButton("🔐 Bot Modes", callback_data="admin_modes", color="negative")
+    )
+    
+    # Row 4: Tools
+    keyboard.add(
+        types.InlineKeyboardButton("📤 Broadcast", callback_data="admin_broadcast", color="primary"),
+        types.InlineKeyboardButton("📥 Clone Config", callback_data="admin_clone", color="primary")
+    )
+    
+    # Row 5: Close
+    keyboard.add(types.InlineKeyboardButton("❌ Close Menu", callback_data="admin_close"))
+    
+    return keyboard
+
+@bot.message_handler(commands=['admin'])
+def handle_admin_command(message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    bot.reply_to(
+        message,
+        "<b>🛠️ ADMIN CONTROL PANEL</b>\n\nSelect an option to manage your bot:",
+        reply_markup=admin_menu_keyboard(),
+        parse_mode="HTML"
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('admin_'))
+def handle_admin_callbacks(call):
+    user_id = call.from_user.id
+    if not is_admin(user_id):
+        bot.answer_callback_query(call.id, "❌ Not an Admin!")
+        return
+    
+    data = call.data
+    
+    if data == "admin_close":
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+        return
+        
+    if data == "admin_channels":
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("➕ Add New Channel", callback_data="chan_add", color="positive"),
+            types.InlineKeyboardButton("📝 Edit Existing Channel", callback_data="chan_list_edit", color="primary"),
+            types.InlineKeyboardButton("❌ Remove Channel", callback_data="chan_list_del", color="negative"),
+            types.InlineKeyboardButton("⬅️ Back to Menu", callback_data="admin_main")
+        )
+        bot.edit_message_text(
+            "<b>📺 CHANNEL MANAGEMENT</b>\n\nAdd, edit or remove premium channels:",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+        
+    elif data == "admin_main":
+        bot.edit_message_text(
+            "<b>🛠️ ADMIN CONTROL PANEL</b>\n\nSelect an option to manage your bot:",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=admin_menu_keyboard(),
+            parse_mode="HTML"
+        )
+        
+    elif data == "admin_upi":
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("📝 Set UPI ID", callback_data="upi_set_id", color="primary"),
+            types.InlineKeyboardButton("👤 Set UPI Name", callback_data="upi_set_name", color="primary"),
+            types.InlineKeyboardButton("⬅️ Back to Menu", callback_data="admin_main")
+        )
+        text = f"<b>💰 UPI SETTINGS</b>\n\n<b>Current ID:</b> <code>{settings.get('upi_id', 'Not Set')}</code>\n<b>Current Name:</b> {settings.get('upi_name', 'Not Set')}"
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb, parse_mode="HTML")
+
+    elif data == "upi_set_id":
+        msg = bot.send_message(call.message.chat.id, "Enter New UPI ID:")
+        bot.register_next_step_handler(msg, lambda m: update_setting(m, 'upi_id', "UPI ID"))
+        
+    elif data == "upi_set_name":
+        msg = bot.send_message(call.message.chat.id, "Enter New UPI Name:")
+        bot.register_next_step_handler(msg, lambda m: update_setting(m, 'upi_name', "UPI Name"))
+
+    elif data == "admin_stats":
+        total_users = len(users_data)
+        premium_users = sum(1 for u in users_data.values() if u.get('is_premium'))
+        total_sales = sum(float(s.get('amount', 0)) for s in sales_data)
+        text = f"<b>📊 BOT STATISTICS</b>\n\n👤 <b>Total Users:</b> {total_users}\n💎 <b>Premium Users:</b> {premium_users}\n💰 <b>Total Revenue:</b> ₹{total_sales:.2f}\n📦 <b>Total Orders:</b> {len(sales_data)}"
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("⬅️ Back", callback_data="admin_main"))
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb, parse_mode="HTML")
+
+    elif data == "admin_modes":
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton(f"🔐 Join-Request: {'ON' if settings.get('join_request_mode') else 'OFF'}", callback_data="mode_toggle_join"),
+            types.InlineKeyboardButton(f"🧾 Proof Status: {'ON' if settings.get('payment_proof_status') else 'OFF'}", callback_data="mode_toggle_proof"),
+            types.InlineKeyboardButton(f"🛡️ Force Join: {'ON' if settings.get('force_join_status') else 'OFF'}", callback_data="mode_toggle_force"),
+            types.InlineKeyboardButton(f"🤖 Auto-Accept: {'ON' if settings.get('auto_accept_requests') else 'OFF'}", callback_data="mode_toggle_auto"),
+            types.InlineKeyboardButton("⬅️ Back to Menu", callback_data="admin_main")
+        )
+        bot.edit_message_text("<b>🔐 BOT MODES</b>\n\nToggle security and automation modes:", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb, parse_mode="HTML")
+
+    elif data.startswith("mode_toggle_"):
+        mode = data.replace("mode_toggle_", "")
+        key = {"join": "join_request_mode", "proof": "payment_proof_status", "force": "force_join_status", "auto": "auto_accept_requests"}.get(mode)
+        if key:
+            settings[key] = not settings.get(key, False)
+            save_settings()
+            handle_admin_callbacks(types.CallbackQuery(id='0', from_user=call.from_user, chat_instance='0', message=call.message, data='admin_modes'))
+
+    elif data == "admin_demo":
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton(f"🔄 Status: {'PAID' if settings.get('demo_paid_status') else 'FREE'}", callback_data="demo_toggle_status"),
+            types.InlineKeyboardButton("💰 Set Demo Price", callback_data="demo_set_price"),
+            types.InlineKeyboardButton("🔗 Set Demo Link", callback_data="demo_set_link"),
+            types.InlineKeyboardButton("🆔 Set Demo ID", callback_data="demo_set_id"),
+            types.InlineKeyboardButton("🎨 Set Button Color", callback_data="demo_set_color"),
+            types.InlineKeyboardButton("⬅️ Back to Menu", callback_data="admin_main")
+        )
+        text = f"<b>🎥 DEMO SETTINGS</b>\n\n<b>Status:</b> {'PAID' if settings.get('demo_paid_status') else 'FREE'}\n<b>Price:</b> ₹{settings.get('demo_amount', '10')}\n<b>ID:</b> <code>{settings.get('demo_channel_id', 'Not Set')}</code>\n<b>Link:</b> {settings.get('demo_channel_link', 'Not Set')}"
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb, parse_mode="HTML")
+
+    elif data == "demo_toggle_status":
+        settings['demo_paid_status'] = not settings.get('demo_paid_status', False)
+        save_settings()
+        handle_admin_callbacks(types.CallbackQuery(id='0', from_user=call.from_user, chat_instance='0', message=call.message, data='admin_demo'))
+
+    elif data == "demo_set_price":
+        msg = bot.send_message(call.message.chat.id, "Enter Demo Price (₹):")
+        bot.register_next_step_handler(msg, lambda m: update_setting(m, 'demo_amount', "Demo Price"))
+
+    elif data == "admin_users":
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("➕ Add Admin", callback_data="admin_add_user"),
+            types.InlineKeyboardButton("❌ Remove Admin", callback_data="admin_rem_user"),
+            types.InlineKeyboardButton("⬅️ Back to Menu", callback_data="admin_main")
+        )
+        text = f"<b>👑 ADMIN MANAGEMENT</b>\n\n<b>Admins:</b> <code>{', '.join(settings.get('admin_ids', []))}</code>"
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb, parse_mode="HTML")
+
+    elif data == "admin_broadcast":
+        msg = bot.send_message(call.message.chat.id, "Send the message (Text/Photo/Video) you want to broadcast to all users:")
+        bot.register_next_step_handler(msg, handle_broadcast)
+        
+    elif data == "admin_clone":
+        msg = bot.send_message(call.message.chat.id, "Enter Source DB Name to clone config from:")
+        bot.register_next_step_handler(msg, lambda m: handle_clone_config(m))
+
+    elif data == "admin_add_user":
+        msg = bot.send_message(call.message.chat.id, "Enter User ID to ADD as Admin:")
+        bot.register_next_step_handler(msg, handle_add_admin)
+        
+    elif data == "admin_rem_user":
+        msg = bot.send_message(call.message.chat.id, "Enter User ID to REMOVE from Admins:")
+        bot.register_next_step_handler(msg, handle_remove_admin)
+
+    elif data == "demo_set_link":
+        msg = bot.send_message(call.message.chat.id, "Enter New Demo Channel Link:")
+        bot.register_next_step_handler(msg, lambda m: update_setting(m, 'demo_channel_link', "Demo Link"))
+
+    elif data == "demo_set_id":
+        msg = bot.send_message(call.message.chat.id, "Enter New Demo Channel ID:")
+        bot.register_next_step_handler(msg, lambda m: update_setting(m, 'demo_channel_id', "Demo ID"))
+
+    elif data == "demo_set_color":
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("🔵 Blue", callback_data="dcolor_blue"),
+            types.InlineKeyboardButton("🟢 Green", callback_data="dcolor_green"),
+            types.InlineKeyboardButton("🔴 Red", callback_data="dcolor_red"),
+            types.InlineKeyboardButton("⚪ Default", callback_data="dcolor_none")
+        )
+        bot.edit_message_text("Select Demo Button Color:", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb)
+
+    elif data.startswith("dcolor_"):
+        color = data.replace("dcolor_", "")
+        settings['demo_color'] = color if color != "none" else ""
+        save_settings()
+        bot.answer_callback_query(call.id, "✅ Demo Color Updated")
+        handle_admin_callbacks(types.CallbackQuery(id='0', from_user=call.from_user, chat_instance='0', message=call.message, data='admin_demo'))
+
+    elif data == "chan_list_edit":
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        for ch in settings.get('premium_channels', []):
+            kb.add(types.InlineKeyboardButton(f"📝 Edit {ch['name']}", callback_data=f"chan_edit_{ch['id']}"))
+        kb.add(types.InlineKeyboardButton("⬅️ Back", callback_data="admin_channels"))
+        bot.edit_message_text("Select channel to EDIT:", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb)
+
+    elif data.startswith("chan_edit_"):
+        chan_id = call.data.replace("chan_edit_", "")
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("📝 Name", callback_data=f"cedit_{chan_id}_name"),
+            types.InlineKeyboardButton("💰 Price", callback_data=f"cedit_{chan_id}_amount"),
+            types.InlineKeyboardButton("🆔 ID", callback_data=f"cedit_{chan_id}_channel_id"),
+            types.InlineKeyboardButton("⏰ Time", callback_data=f"cedit_{chan_id}_duration"),
+            types.InlineKeyboardButton("🎨 Color", callback_data=f"cedit_{chan_id}_color"),
+            types.InlineKeyboardButton("⬅️ Back", callback_data="chan_list_edit")
+        )
+        bot.edit_message_text("Select field to edit:", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb)
+
+    elif data.startswith("cedit_"):
+        parts = data.split('_')
+        chan_id = parts[1]
+        field = parts[2]
+        
+        if field == "color":
+            kb = types.InlineKeyboardMarkup(row_width=2)
+            kb.add(
+                types.InlineKeyboardButton("🔵 Blue", callback_data=f"cecolor_{chan_id}_blue"),
+                types.InlineKeyboardButton("🟢 Green", callback_data=f"cecolor_{chan_id}_green"),
+                types.InlineKeyboardButton("🔴 Red", callback_data=f"cecolor_{chan_id}_red"),
+                types.InlineKeyboardButton("⚪ Default", callback_data=f"cecolor_{chan_id}_none")
+            )
+            bot.edit_message_text("Select New Color:", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb)
+        else:
+            msg = bot.send_message(call.message.chat.id, f"Enter New {field.capitalize()}:")
+            bot.register_next_step_handler(msg, process_chan_edit, chan_id, field)
+
+    elif data.startswith("cecolor_"):
+        parts = data.split('_')
+        chan_id = parts[1]
+        color = parts[2]
+        for ch in settings.get('premium_channels', []):
+            if ch['id'] == chan_id:
+                ch['color'] = color if color != "none" else ""
+                break
+        save_settings()
+        bot.answer_callback_query(call.id, "✅ Color Updated")
+        handle_admin_callbacks(types.CallbackQuery(id='0', from_user=call.from_user, chat_instance='0', message=call.message, data=f"chan_edit_{chan_id}"))
+
+    bot.answer_callback_query(call.id)
+
+def process_chan_edit(message, chan_id, field):
+    val = message.text.strip()
+    if field == "amount": val = clean_amount_str(val)
+    for ch in settings.get('premium_channels', []):
+        if ch['id'] == chan_id:
+            ch[field] = val
+            break
+    save_settings()
+    bot.send_message(message.chat.id, f"✅ {field.capitalize()} updated to: {val}")
+
+def update_setting(message, key, name):
+    settings[key] = message.text.strip()
+    save_settings()
+    bot.send_message(message.chat.id, f"✅ {name} updated to: <code>{settings[key]}</code>", parse_mode="HTML")
+
+# ========== CHANNEL MANAGEMENT FLOWS ==========
+@bot.callback_query_handler(func=lambda call: call.data.startswith('chan_'))
+def handle_channel_callbacks(call):
+    if not is_admin(call.from_user.id): return
+    
+    if call.data == "chan_add":
+        msg = bot.send_message(call.message.chat.id, "<b>➕ Add New Channel</b>\n\nEnter Channel Name (e.g. <i>Premium VIP</i>):", parse_mode="HTML")
+        bot.register_next_step_handler(msg, process_chan_name)
+    
+    elif call.data == "chan_list_del":
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        for ch in settings.get('premium_channels', []):
+            kb.add(types.InlineKeyboardButton(f"❌ Delete {ch['name']}", callback_data=f"chan_del_{ch['id']}"))
+        kb.add(types.InlineKeyboardButton("⬅️ Back", callback_data="admin_channels"))
+        bot.edit_message_text("Select channel to DELETE:", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb)
+
+    elif call.data.startswith("chan_del_"):
+        chan_id = call.data.replace("chan_del_", "")
+        settings['premium_channels'] = [ch for ch in settings.get('premium_channels', []) if ch['id'] != chan_id]
+        save_settings()
+        bot.answer_callback_query(call.id, "✅ Channel Deleted")
+        handle_admin_callbacks(types.CallbackQuery(id='0', from_user=call.from_user, chat_instance='0', message=call.message, data='admin_channels'))
+
+    bot.answer_callback_query(call.id)
+
+def process_chan_name(message):
+    name = message.text.strip()
+    msg = bot.send_message(message.chat.id, f"<b>Name:</b> {name}\n\nEnter Amount (₹):", parse_mode="HTML")
+    bot.register_next_step_handler(msg, process_chan_amount, name)
+
+def process_chan_amount(message, name):
+    amount = clean_amount_str(message.text)
+    msg = bot.send_message(message.chat.id, f"<b>Name:</b> {name}\n<b>Amount:</b> ₹{amount}\n\nEnter Telegram Channel ID (e.g. <code>-100...</code>):", parse_mode="HTML")
+    bot.register_next_step_handler(msg, process_chan_id, name, amount)
+
+def process_chan_id(message, name, amount):
+    ch_id = message.text.strip()
+    msg = bot.send_message(message.chat.id, f"<b>Name:</b> {name}\n<b>Amount:</b> ₹{amount}\n<b>ID:</b> {ch_id}\n\nEnter Duration (e.g. <i>30 Days</i>):", parse_mode="HTML")
+    bot.register_next_step_handler(msg, process_chan_duration, name, amount, ch_id)
+
+def process_chan_duration(message, name, amount, ch_id):
+    duration = message.text.strip()
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("🔵 Blue", callback_data=f"cset_{name}|{amount}|{ch_id}|{duration}|blue"),
+        types.InlineKeyboardButton("🟢 Green", callback_data=f"cset_{name}|{amount}|{ch_id}|{duration}|green"),
+        types.InlineKeyboardButton("🔴 Red", callback_data=f"cset_{name}|{amount}|{ch_id}|{duration}|red"),
+        types.InlineKeyboardButton("⚪ Default", callback_data=f"cset_{name}|{amount}|{ch_id}|{duration}|none")
+    )
+    bot.send_message(message.chat.id, "Select Button Color:", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('cset_'))
+def finalize_chan_add(call):
+    if not is_admin(call.from_user.id): return
+    
+    # name|amount|ch_id|duration|color
+    data = call.data.replace("cset_", "").split('|')
+    name, amount, ch_id, duration, color = data
+    
+    new_id = f"ch_{random.randint(1000, 9999)}"
+    new_chan = {
+        "id": new_id,
+        "name": name,
+        "amount": amount,
+        "channel_id": ch_id,
+        "duration": duration,
+        "color": color if color != "none" else "",
+        "description": ""
+    }
+    
+    if 'premium_channels' not in settings: settings['premium_channels'] = []
+    settings['premium_channels'].append(new_chan)
+    save_settings()
+    
+    bot.edit_message_text(f"✅ <b>Channel Added Successfully!</b>\n\n<b>Name:</b> {name}\n<b>Price:</b> ₹{amount}\n<b>ID:</b> <code>{ch_id}</code>", chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML")
+    bot.answer_callback_query(call.id)
+
 @bot.message_handler(commands=['settings'])
 def handle_settings(message):
     if not is_admin(message.from_user.id):
@@ -2014,49 +2371,108 @@ def handle_sales(message):
 
 # ========== /ADMIN COMMANDS (NEW) ==========
 @bot.message_handler(commands=['add_admin'])
-def handle_add_admin(message):
+def handle_add_admin(message, user_id=None):
     if not is_admin(message.from_user.id):
         return
         
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "Usage: <code>/add_admin user_id</code>", parse_mode="HTML")
-        return
+    if user_id is None:
+        args = message.text.split()
+        if len(args) < 2:
+            bot.reply_to(message, "Usage: <code>/add_admin user_id</code>", parse_mode="HTML")
+            return
+        new_admin = args[1].strip()
+    else:
+        new_admin = message.text.strip()
         
-    new_admin = args[1].strip()
     if 'admin_ids' not in settings:
         settings['admin_ids'] = []
         
-    if new_admin not in settings['admin_ids']:
-        settings['admin_ids'].append(new_admin)
+    if str(new_admin) not in [str(a) for a in settings['admin_ids']]:
+        settings['admin_ids'].append(str(new_admin))
         save_settings()
-        bot.reply_to(message, f"✅ User <code>{new_admin}</code> added to admins.", parse_mode="HTML")
+        bot.send_message(message.chat.id, f"✅ User <code>{new_admin}</code> added to admins.", parse_mode="HTML")
     else:
-        bot.reply_to(message, "User is already an admin.")
+        bot.send_message(message.chat.id, "User is already an admin.")
 
 @bot.message_handler(commands=['remove_admin'])
-def handle_remove_admin(message):
+def handle_remove_admin(message, user_id=None):
     if not is_admin(message.from_user.id):
         return
         
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "Usage: <code>/remove_admin user_id</code>", parse_mode="HTML")
-        return
-        
-    admin_to_remove = args[1].strip()
+    if user_id is None:
+        args = message.text.split()
+        if len(args) < 2:
+            bot.reply_to(message, "Usage: <code>/remove_admin user_id</code>", parse_mode="HTML")
+            return
+        admin_to_remove = args[1].strip()
+    else:
+        admin_to_remove = message.text.strip()
     
     # Don't allow removing the last admin
     if len(settings.get('admin_ids', [])) <= 1:
-        bot.reply_to(message, "❌ Cannot remove the last admin.")
+        bot.send_message(message.chat.id, "❌ Cannot remove the last admin.")
         return
         
-    if admin_to_remove in settings.get('admin_ids', []):
-        settings['admin_ids'].remove(admin_to_remove)
+    admin_ids = [str(a) for a in settings.get('admin_ids', [])]
+    if str(admin_to_remove) in admin_ids:
+        settings['admin_ids'] = [a for a in settings['admin_ids'] if str(a) != str(admin_to_remove)]
         save_settings()
-        bot.reply_to(message, f"✅ User <code>{admin_to_remove}</code> removed from admins.", parse_mode="HTML")
+        bot.send_message(message.chat.id, f"✅ User <code>{admin_to_remove}</code> removed from admins.", parse_mode="HTML")
     else:
-        bot.reply_to(message, "User is not in admin list.")
+        bot.send_message(message.chat.id, "User is not in admin list.")
+
+@bot.message_handler(commands=['clone_config'])
+def handle_clone_config(message):
+    """Clone THIS bot's CONFIG (settings + demos + media) from another DB in the same cluster.
+    USER data (users, sales, verifications, join requests, invite links) is NEVER copied."""
+    if not is_admin(message.from_user.id):
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(
+            message,
+            "📥 <b>Clone Config</b>\n\n"
+            "Usage: <code>/clone_config &lt;source_db_name&gt;</code>\n\n"
+            f"• This bot's DB: <code>{config.DB_NAME}</code>\n"
+            "• <code>source_db_name</code> = the other bot's MongoDB database name to copy config from\n\n"
+            "<b>Copies:</b> settings, premium channels, demos + demo media, start message.\n"
+            "<b>Never copies:</b> users, sales, verifications, join requests (kept separate).",
+            parse_mode="HTML",
+        )
+        return
+
+    source_db = args[1].strip().strip('"').strip("'")
+    bot.reply_to(message, f"⏳ Cloning config from <code>{source_db}</code> into <code>{config.DB_NAME}</code>...", parse_mode="HTML")
+
+    try:
+        ok, summary, detail = config.clone_config_from(source_db)
+    except Exception as e:
+        bot.reply_to(message, f"❌ Clone failed: <code>{config.redact_secrets_from_text(str(e))}</code>", parse_mode="HTML")
+        return
+
+    if not ok:
+        bot.reply_to(message, f"❌ Clone not applied.\n<code>{config.redact_secrets_from_text(detail)}</code>", parse_mode="HTML")
+        return
+
+    try:
+        config.refresh_in_memory_data()
+        reloaded = True
+    except Exception as e:
+        reloaded = False
+        logging.warning(f"clone_config: in-memory refresh failed: {type(e).__name__}")
+
+    bot.reply_to(
+        message,
+        "✅ <b>Config cloned successfully!</b>\n\n"
+        f"<b>Source:</b> <code>{summary.get('source_db')}</code>\n"
+        f"<b>Target:</b> <code>{summary.get('target_db')}</code>\n"
+        f"<b>Settings:</b> {'✔ copied' if summary.get('settings') else '—'}\n"
+        f"<b>Start message:</b> {'✔ copied' if summary.get('start_message') else '—'}\n"
+        f"<b>Media files copied:</b> {summary.get('media', 0)}\n\n"
+        + ("Settings reloaded live. ✅" if reloaded else "⚠️ Restart the bot to apply everything."),
+        parse_mode="HTML",
+    )
 
 # Legacy channel commands removed
 
