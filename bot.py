@@ -164,6 +164,10 @@ def make_button(text, **kwargs):
         kwargs['style'] = rnd_color()
     return types.InlineKeyboardButton(text, **kwargs)
 
+def _html_escape(s):
+    """Escape user-entered text so Telegram HTML parse fail na ho (& < >)."""
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
 def is_admin(user_id):
     """Check if a user is an admin"""
     admin_ids = settings.get('admin_ids', [])
@@ -1506,30 +1510,34 @@ def handle_plan_selection(call):
         plan = config.PLANS[plan_type]
     else:
         channels = settings.get("premium_channels", [])
-        plan = next((ch for ch in channels if ch['id'] == plan_type), None)
+        plan = next((ch for ch in channels if ch.get('id') == plan_type), None)
 
     if not plan:
         bot.answer_callback_query(call.id, "❌ Plan not found!", show_alert=True)
         return
 
-    plan_demos = settings.get('plan_demo_videos', {}).get(plan_type, [])
-    if plan_demos:
-        plan_desc = settings.get('plan_demo_descs', {}).get(plan_type, "")
-        send_demo_videos(chat_id, plan_demos, caption=plan_desc)
+    # Loading spinner turant band karo — baaki kaam uske baad
+    bot.answer_callback_query(call.id)
 
-    custom_desc = plan.get('description', '') or ""
-    if custom_desc:
-        features_text = custom_desc
-    else:
-        features_text = """✅ High Quality Content
+    try:
+        plan_demos = settings.get('plan_demo_videos', {}).get(plan_type, [])
+        if plan_demos:
+            plan_desc = settings.get('plan_demo_descs', {}).get(plan_type, "")
+            send_demo_videos(chat_id, plan_demos, caption=plan_desc)
+
+        custom_desc = plan.get('description', '') or ""
+        if custom_desc:
+            features_text = custom_desc
+        else:
+            features_text = """✅ High Quality Content
 ✅ Direct Access After Payment
 ✅ 24/7 Support Available"""
 
-    desc_text = f"""
-<b>💎 {plan['name'].upper()} DESCRIPTION:</b>
+        desc_text = f"""
+<b>💎 {_html_escape(plan.get('name', 'Premium'))} DESCRIPTION:</b>
 
-💰 <b>Amount:</b> ₹{plan['amount']}
-⏳ <b>Duration:</b> {plan.get('duration', 'N/A')}
+💰 <b>Amount:</b> ₹{_html_escape(plan.get('amount', ''))}
+⏳ <b>Duration:</b> {_html_escape(plan.get('duration', 'N/A'))}
 
 <b>Features:</b>
 {features_text}
@@ -1537,20 +1545,31 @@ def handle_plan_selection(call):
 <i>Click "💳 Buy Now" below to get the payment QR code.</i>
     """
 
-    keyboard = types.InlineKeyboardMarkup(row_width=2)
-    btn_buy = make_button("💳 Buy Now", callback_data=f"buy_{plan_type}")
-    btn_back = make_button("🔙 Back", callback_data="back_to_main")
-    keyboard.add(btn_buy, btn_back)
+        keyboard = types.InlineKeyboardMarkup(row_width=2)
+        btn_buy = make_button("💳 Buy Now", callback_data=f"buy_{plan_type}")
+        btn_back = make_button("🔙 Back", callback_data="back_to_main")
+        keyboard.add(btn_buy, btn_back)
 
-    m = bot.send_message(
-        chat_id,
-        desc_text,
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
-    track_msg(chat_id, m.message_id)
-
-    bot.answer_callback_query(call.id)
+        try:
+            m = bot.send_message(chat_id, desc_text, reply_markup=keyboard, parse_mode="HTML")
+        except Exception as _se:
+            # Zyada-tar HTML parse error (naam/desc me & < >). Escaped fallback bhejo.
+            logging.error(f"Plan desc HTML send failed ({type(_se).__name__}): {_se}")
+            try:
+                m = bot.send_message(chat_id, _html_escape(desc_text), reply_markup=keyboard, parse_mode="HTML")
+            except Exception as _se2:
+                logging.error(f"Plan desc escaped fallback failed ({type(_se2).__name__}): {_se2}")
+                plain = (f"💎 {plan.get('name', 'Premium')}\n"
+                         f"💰 Amount: ₹{plan.get('amount', '')}\n"
+                         f"⏳ Duration: {plan.get('duration', 'N/A')}")
+                m = bot.send_message(chat_id, plain, reply_markup=keyboard)
+        track_msg(chat_id, m.message_id)
+    except Exception as e:
+        logging.error(f"Plan selection error ({plan_type}): {type(e).__name__}: {e}")
+        try:
+            bot.send_message(chat_id, "⚠️ Kuch technical issue aa gaya. Please /start dobara karein.")
+        except Exception:
+            pass
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('buy_'))
 def handle_buy_now(call):
@@ -1653,11 +1672,11 @@ Jab tak admin purane payment ko verify/reject nahi kar dete, aap naya payment cr
         return
 
     caption = f"""
-<b>💰 ORDER #{order_num}: PAY ₹{plan['amount']} FOR {plan['name'].upper()}</b>
+<b>💰 ORDER #{order_num}: PAY ₹{plan['amount']} FOR {_html_escape(plan['name']).upper()}</b>
 
 <b>UPI Details:</b>
-└ ID: <code>{settings['upi_id']}</code>
-└ Name: {settings['upi_name']}
+└ ID: <code>{_html_escape(settings['upi_id'])}</code>
+└ Name: {_html_escape(settings['upi_name'])}
 └ Amount: <b>₹{plan['amount']}</b>
 
 <b>Instructions:</b>
@@ -1733,7 +1752,7 @@ def send_pay2_payment(chat_id, user_id, plan_type, amount, plan_name, order_num)
         pending_verifications[str(user_id)] = pv
 
     text = f"""
-<b>💰 ORDER #{order_num}: PAY ₹{amount} FOR {plan_name.upper()}</b>
+<b>💰 ORDER #{order_num}: PAY ₹{amount} FOR {_html_escape(plan_name).upper()}</b>
 
 ✅ <b>Secure payment link ready hai.</b>
 
