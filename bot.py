@@ -15,7 +15,7 @@ import sys
 # Import config and verification
 import config
 from config import *
-from verif import init_verification, get_random_button_color, make_colored_button, resolve_color, color_name_display
+from verif import init_verification, make_colored_button, resolve_color, color_name_display, get_random_button_color_nondefault
 
 # Initialize bot — SAFE TOKEN VALIDATION & VERIFICATION
 # Priority: env var via config.BOT_TOKEN (loaded from .env)
@@ -110,49 +110,48 @@ del _token_fmt_ok, _re, _attempt, _bot_token_retry, _bot_token_retry_wait
 # NOTE: Keep `_token` local to the module; the `bot` instance is the handle.
 # We intentionally do NOT log/print the actual token anywhere.
 
-# ========== BUTTON COLOR FIX (API 7.0+ support) ==========
+# ========== BUTTON COLOR FIX (Strict Background Color Support) ==========
 _original_ikb_init = types.InlineKeyboardButton.__init__
 def _patched_ikb_init(self, *args, **kwargs):
-    # Extract color-related fields from kwargs before calling original init
-    color = kwargs.pop('color', None)
-    btn_color = kwargs.pop('button_color', None)
+    # Extract color-related fields (supporting style, color, or button_color)
+    style = kwargs.pop('style', None) or kwargs.pop('color', None) or kwargs.pop('button_color', None)
     _original_ikb_init(self, *args, **kwargs)
-    # Store them manually since the original init ignores unknown kwargs
-    if color: self.color = color
-    if btn_color: self.button_color = btn_color
+    if style:
+        # Resolve common names to Telegram's required values: primary, success, danger
+        s = str(style).lower()
+        if s in ["blue", "primary"]: self.button_style = "primary"
+        elif s in ["green", "positive", "success"]: self.button_style = "success"
+        elif s in ["red", "negative", "danger"]: self.button_style = "danger"
+        else: self.button_style = None
 
 types.InlineKeyboardButton.__init__ = _patched_ikb_init
 
 _original_ikb_to_dict = types.InlineKeyboardButton.to_dict
 def _patched_ikb_to_dict(self):
     json_dict = _original_ikb_to_dict(self)
-    # Add color field for Telegram API 7.0+
-    color = getattr(self, 'button_color', None) or getattr(self, 'color', None)
-    if color:
-        # Resolve common names (blue -> primary, etc)
-        resolved = color
-        if 'verif' in globals() and hasattr(verif, 'resolve_color'):
-            resolved = verif.resolve_color(color)
-        if resolved in ["primary", "positive", "negative"]:
-            json_dict['color'] = resolved
+    style = getattr(self, 'button_style', None)
+    if style in ["primary", "success", "danger"]:
+        json_dict['style'] = style
     return json_dict
+
 types.InlineKeyboardButton.to_dict = _patched_ikb_to_dict
+
 
 # Initialize verification system
 verif = init_verification(bot)
 
-BUTTON_COLORS_BOT = [None, "primary", "positive", "negative"]
+BUTTON_COLORS_BOT = [None, "primary", "success", "danger"]
 
 def rnd_color():
     """Shortcut for random button color (always returns a premium color)"""
     if 'verif' in globals() and hasattr(verif, 'get_random_button_color_nondefault'):
         return verif.get_random_button_color_nondefault()
-    return random.choice(["primary", "positive", "negative"])
+    return random.choice(["primary", "success", "danger"])
 
 def make_button(text, **kwargs):
     """Create InlineKeyboardButton with random color if no URL."""
     if 'url' not in kwargs:
-        kwargs['button_color'] = rnd_color()
+        kwargs['style'] = rnd_color()
     return types.InlineKeyboardButton(text, **kwargs)
 
 def is_admin(user_id):
