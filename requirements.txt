@@ -2,6 +2,8 @@ pyTelegramBotAPI
 qrcode
 pillow
 requests
+pycryptodome
+pysocks
 gunicorn
 flask
 python-dotenv
