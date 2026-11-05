@@ -144,17 +144,15 @@ verif = init_verification(bot)
 BUTTON_COLORS_BOT = [None, "primary", "positive", "negative"]
 
 def rnd_color():
-    """Shortcut for random button color"""
-    return random.choice(BUTTON_COLORS_BOT)
+    """Shortcut for random button color (always returns a premium color)"""
+    if 'verif' in globals() and hasattr(verif, 'get_random_button_color_nondefault'):
+        return verif.get_random_button_color_nondefault()
+    return random.choice(["primary", "positive", "negative"])
 
 def make_button(text, **kwargs):
-    """Create InlineKeyboardButton with random color if no URL (color passed via button_color).
-    Compatible with Telegram Bot API's button color field: primary (blue), positive (green), negative (red).
-    """
-    if 'url' not in kwargs and 'button_color' not in kwargs and 'color' not in kwargs:
-        color = rnd_color()
-        if color is not None:
-            kwargs['button_color'] = color
+    """Create InlineKeyboardButton with random color if no URL."""
+    if 'url' not in kwargs:
+        kwargs['button_color'] = rnd_color()
     return types.InlineKeyboardButton(text, **kwargs)
 
 def is_admin(user_id):
@@ -1808,10 +1806,9 @@ def handle_admin_callbacks(call):
             types.InlineKeyboardButton("💰 Set Demo Price", callback_data="demo_set_price"),
             types.InlineKeyboardButton("🔗 Set Demo Link", callback_data="demo_set_link"),
             types.InlineKeyboardButton("🆔 Set Demo ID", callback_data="demo_set_id"),
-            types.InlineKeyboardButton("🎨 Set Button Color", callback_data="demo_set_color"),
             types.InlineKeyboardButton("⬅️ Back to Menu", callback_data="admin_main")
         )
-        text = f"<b>🎥 DEMO SETTINGS</b>\n\n<b>Status:</b> {'PAID' if settings.get('demo_paid_status') else 'FREE'}\n<b>Price:</b> ₹{settings.get('demo_amount', '10')}\n<b>ID:</b> <code>{settings.get('demo_channel_id', 'Not Set')}</code>\n<b>Link:</b> {settings.get('demo_channel_link', 'Not Set')}"
+        text = f"<b>🎥 DEMO SETTINGS</b>\n\n<b>Status:</b> {'PAID' if settings.get('demo_paid_status') else 'FREE'}\n<b>Price:</b> ₹{settings.get('demo_amount', '10')}\n<b>ID:</b> <code>{settings.get('demo_channel_id', 'Not Set')}</code>\n<b>Link:</b> {settings.get('demo_channel_link', 'Not Set')}\n<b>Color:</b> Auto-Random 🎲"
         bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb, parse_mode="HTML")
 
     elif data == "demo_toggle_status":
@@ -1857,23 +1854,6 @@ def handle_admin_callbacks(call):
         msg = bot.send_message(call.message.chat.id, "Enter New Demo Channel ID:")
         bot.register_next_step_handler(msg, lambda m: update_setting(m, 'demo_channel_id', "Demo ID"))
 
-    elif data == "demo_set_color":
-        kb = types.InlineKeyboardMarkup(row_width=2)
-        kb.add(
-            types.InlineKeyboardButton("🔵 Blue", callback_data="dcolor_blue"),
-            types.InlineKeyboardButton("🟢 Green", callback_data="dcolor_green"),
-            types.InlineKeyboardButton("🔴 Red", callback_data="dcolor_red"),
-            types.InlineKeyboardButton("⚪ Default", callback_data="dcolor_none")
-        )
-        bot.edit_message_text("Select Demo Button Color:", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb)
-
-    elif data.startswith("dcolor_"):
-        color = data.replace("dcolor_", "")
-        settings['demo_color'] = color if color != "none" else ""
-        save_settings()
-        bot.answer_callback_query(call.id, "✅ Demo Color Updated")
-        handle_admin_callbacks(types.CallbackQuery(id='0', from_user=call.from_user, chat_instance='0', message=call.message, data='admin_demo'))
-
     elif data == "chan_list_edit":
         kb = types.InlineKeyboardMarkup(row_width=1)
         for ch in settings.get('premium_channels', []):
@@ -1889,40 +1869,17 @@ def handle_admin_callbacks(call):
             types.InlineKeyboardButton("💰 Price", callback_data=f"cedit_{chan_id}_amount"),
             types.InlineKeyboardButton("🆔 ID", callback_data=f"cedit_{chan_id}_channel_id"),
             types.InlineKeyboardButton("⏰ Time", callback_data=f"cedit_{chan_id}_duration"),
-            types.InlineKeyboardButton("🎨 Color", callback_data=f"cedit_{chan_id}_color"),
             types.InlineKeyboardButton("⬅️ Back", callback_data="chan_list_edit")
         )
-        bot.edit_message_text("Select field to edit:", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb)
+        bot.edit_message_text("Select field to edit (Colors are now Auto-Random):", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb)
 
     elif data.startswith("cedit_"):
         parts = data.split('_')
         chan_id = parts[1]
         field = parts[2]
         
-        if field == "color":
-            kb = types.InlineKeyboardMarkup(row_width=2)
-            kb.add(
-                types.InlineKeyboardButton("🔵 Blue", callback_data=f"cecolor_{chan_id}_blue"),
-                types.InlineKeyboardButton("🟢 Green", callback_data=f"cecolor_{chan_id}_green"),
-                types.InlineKeyboardButton("🔴 Red", callback_data=f"cecolor_{chan_id}_red"),
-                types.InlineKeyboardButton("⚪ Default", callback_data=f"cecolor_{chan_id}_none")
-            )
-            bot.edit_message_text("Select New Color:", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb)
-        else:
-            msg = bot.send_message(call.message.chat.id, f"Enter New {field.capitalize()}:")
-            bot.register_next_step_handler(msg, process_chan_edit, chan_id, field)
-
-    elif data.startswith("cecolor_"):
-        parts = data.split('_')
-        chan_id = parts[1]
-        color = parts[2]
-        for ch in settings.get('premium_channels', []):
-            if ch['id'] == chan_id:
-                ch['color'] = color if color != "none" else ""
-                break
-        save_settings()
-        bot.answer_callback_query(call.id, "✅ Color Updated")
-        handle_admin_callbacks(types.CallbackQuery(id='0', from_user=call.from_user, chat_instance='0', message=call.message, data=f"chan_edit_{chan_id}"))
+        msg = bot.send_message(call.message.chat.id, f"Enter New {field.capitalize()}:")
+        bot.register_next_step_handler(msg, process_chan_edit, chan_id, field)
 
     bot.answer_callback_query(call.id)
 
@@ -1983,22 +1940,6 @@ def process_chan_id(message, name, amount):
 
 def process_chan_duration(message, name, amount, ch_id):
     duration = message.text.strip()
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("🔵 Blue", callback_data=f"cset_{name}|{amount}|{ch_id}|{duration}|blue"),
-        types.InlineKeyboardButton("🟢 Green", callback_data=f"cset_{name}|{amount}|{ch_id}|{duration}|green"),
-        types.InlineKeyboardButton("🔴 Red", callback_data=f"cset_{name}|{amount}|{ch_id}|{duration}|red"),
-        types.InlineKeyboardButton("⚪ Default", callback_data=f"cset_{name}|{amount}|{ch_id}|{duration}|none")
-    )
-    bot.send_message(message.chat.id, "Select Button Color:", reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('cset_'))
-def finalize_chan_add(call):
-    if not is_admin(call.from_user.id): return
-    
-    # name|amount|ch_id|duration|color
-    data = call.data.replace("cset_", "").split('|')
-    name, amount, ch_id, duration, color = data
     
     new_id = f"ch_{random.randint(1000, 9999)}"
     new_chan = {
@@ -2007,7 +1948,7 @@ def finalize_chan_add(call):
         "amount": amount,
         "channel_id": ch_id,
         "duration": duration,
-        "color": color if color != "none" else "",
+        "color": "", # Color will be random every time it's displayed
         "description": ""
     }
     
@@ -2015,8 +1956,7 @@ def finalize_chan_add(call):
     settings['premium_channels'].append(new_chan)
     save_settings()
     
-    bot.edit_message_text(f"✅ <b>Channel Added Successfully!</b>\n\n<b>Name:</b> {name}\n<b>Price:</b> ₹{amount}\n<b>ID:</b> <code>{ch_id}</code>", chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML")
-    bot.answer_callback_query(call.id)
+    bot.send_message(message.chat.id, f"✅ <b>Channel Added Successfully!</b>\n\n<b>Name:</b> {name}\n<b>Price:</b> ₹{amount}\n<b>ID:</b> <code>{ch_id}</code>\n<b>Color:</b> Auto-Random 🎲", parse_mode="HTML")
 
 @bot.message_handler(commands=['settings'])
 def handle_settings(message):
@@ -2028,9 +1968,8 @@ def handle_settings(message):
     for ch in settings.get('premium_channels', []):
         ch_id_display = ch.get('channel_id', ch.get('channel_ids', 'Not Set'))
         ch_desc = ch.get('description', '')
-        ch_color = color_name_display(ch.get('color', ''))
         desc_display = f"\n  📝 Desc: {ch_desc[:50]}{'...' if len(ch_desc) > 50 else ''}" if ch_desc else ""
-        ch_info += f"• {ch.get('id', '??')}: {ch.get('name', 'Unknown')} (₹{ch.get('amount', '0')}) - <code>{ch_id_display}</code>\n  🎨 Color: {ch_color}{desc_display}\n"
+        ch_info += f"• {ch.get('id', '??')}: {ch.get('name', 'Unknown')} (₹{ch.get('amount', '0')}) - <code>{ch_id_display}</code>\n  🎨 Color: Auto-Random 🎲{desc_display}\n"
 
     text = f"""
 <b>⚙️ CURRENT SETTINGS</b>
@@ -2039,7 +1978,7 @@ def handle_settings(message):
 <b>📢 Demo Link:</b> {settings.get('demo_channel_link', 'Not Set')}
 <b>🆔 Demo ID:</b> <code>{settings.get('demo_channel_id', 'Not Set')}</code>
 <b>💰 Demo Price:</b> ₹{settings.get('demo_amount', '10')}
-<b>🎨 Demo Button Color:</b> {color_name_display(settings.get('demo_color', ''))}
+<b>🎨 Demo Button Color:</b> Auto-Random 🎲
 <b>🔄 Demo Status:</b> {'PAID' if settings.get('demo_paid_status', False) else 'FREE'}
 
 <b>📋 Log Channel:</b> {settings.get('log_channel', 'Not Set')}
