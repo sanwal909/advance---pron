@@ -1037,6 +1037,15 @@ def pay2_proxy_keyboard():
     return kb
 
 
+def _safe_edit_text(chat_id, message_id, text, reply_markup=None):
+    """edit_message_text safely — 'message is not modified' (same content) par crash na ho."""
+    try:
+        bot.edit_message_text(text, chat_id=chat_id, message_id=message_id,
+                              reply_markup=reply_markup, parse_mode="HTML")
+    except Exception:
+        pass
+
+
 def pay2_proxy_ask_url(message):
     """Admin se proxy URL lo, normalize karke save + sync karo (creds message delete)."""
     if not is_admin(message.from_user.id):
@@ -2344,13 +2353,8 @@ def handle_admin_callbacks(call):
         bot.answer_callback_query(call.id)
 
     elif data == "pay_proxy":
-        bot.edit_message_text(
-            pay2_proxy_menu_text(),
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=pay2_proxy_keyboard(),
-            parse_mode="HTML"
-        )
+        _safe_edit_text(call.message.chat.id, call.message.message_id,
+                        pay2_proxy_menu_text(), pay2_proxy_keyboard())
         bot.answer_callback_query(call.id)
 
     elif data == "pay_proxy_set":
@@ -2372,26 +2376,16 @@ def handle_admin_callbacks(call):
         settings['pay2_proxy'] = 'off'
         save_settings()
         sync_pay2_proxy()
-        bot.edit_message_text(
-            pay2_proxy_menu_text(),
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=pay2_proxy_keyboard(),
-            parse_mode="HTML"
-        )
+        _safe_edit_text(call.message.chat.id, call.message.message_id,
+                        pay2_proxy_menu_text(), pay2_proxy_keyboard())
         bot.answer_callback_query(call.id, "🚫 Proxy disabled")
 
     elif data == "pay_proxy_reset":
         settings['pay2_proxy'] = ''
         save_settings()
         sync_pay2_proxy()
-        bot.edit_message_text(
-            pay2_proxy_menu_text(),
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=pay2_proxy_keyboard(),
-            parse_mode="HTML"
-        )
+        _safe_edit_text(call.message.chat.id, call.message.message_id,
+                        pay2_proxy_menu_text(), pay2_proxy_keyboard())
         bot.answer_callback_query(call.id, "♻️ Default par reset")
 
     elif data == "pay_clear_acc":
@@ -2433,7 +2427,7 @@ def handle_admin_callbacks(call):
         if key:
             settings[key] = not settings.get(key, False)
             save_settings()
-            handle_admin_callbacks(types.CallbackQuery(id='0', from_user=call.from_user, chat_instance='0', message=call.message, data='admin_modes'))
+            handle_admin_callbacks(types.CallbackQuery(id='0', from_user=call.from_user, chat_instance='0', message=call.message, data='admin_modes', json_string='{}'))
 
     elif data == "admin_demo":
         kb = types.InlineKeyboardMarkup(row_width=1)
@@ -2450,7 +2444,7 @@ def handle_admin_callbacks(call):
     elif data == "demo_toggle_status":
         settings['demo_paid_status'] = not settings.get('demo_paid_status', False)
         save_settings()
-        handle_admin_callbacks(types.CallbackQuery(id='0', from_user=call.from_user, chat_instance='0', message=call.message, data='admin_demo'))
+        handle_admin_callbacks(types.CallbackQuery(id='0', from_user=call.from_user, chat_instance='0', message=call.message, data='admin_demo', json_string='{}'))
 
     elif data == "demo_set_price":
         msg = bot.send_message(call.message.chat.id, "Enter Demo Price (₹):")
@@ -2679,7 +2673,7 @@ def handle_channel_callbacks(call):
         settings['premium_channels'] = [ch for ch in settings.get('premium_channels', []) if ch['id'] != chan_id]
         save_settings()
         bot.answer_callback_query(call.id, "✅ Channel Deleted")
-        handle_admin_callbacks(types.CallbackQuery(id='0', from_user=call.from_user, chat_instance='0', message=call.message, data='admin_channels'))
+        handle_admin_callbacks(types.CallbackQuery(id='0', from_user=call.from_user, chat_instance='0', message=call.message, data='admin_channels', json_string='{}'))
 
     bot.answer_callback_query(call.id)
 
