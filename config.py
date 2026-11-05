@@ -641,14 +641,24 @@ def _read_json_raw(filepath):
     return None
 
 def _write_json_raw(filepath, data):
-    """Write JSON file atomically via temp rename to avoid truncation on crash."""
+    """Write JSON file atomically via temp rename to avoid truncation on crash.
+    Har write ke liye UNIQUE temp naam (pid+uuid) use hota hai taaki do concurrent
+    saves ek hi .tmp par clash na karein (warna os.replace FileNotFoundError deta hai)."""
     directory = os.path.dirname(filepath)
     if directory and not os.path.exists(directory):
         os.makedirs(directory, exist_ok=True)
-    tmp_path = filepath + ".tmp"
-    with open(tmp_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
-    os.replace(tmp_path, filepath)
+    tmp_path = f"{filepath}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+        os.replace(tmp_path, filepath)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
     return True
 
 def save_json_file(filepath, data):
