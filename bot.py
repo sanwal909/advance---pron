@@ -1499,7 +1499,7 @@ def handle_plan_selection(call):
     if msg_id in user_all_messages.get(str(chat_id), []):
         user_all_messages[str(chat_id)].remove(msg_id)
 
-    plan_type = call.data.split('_')[1]
+    plan_type = call.data[len("plan_"):]  # channel id me underscore ho sakta hai (ch_1234)
 
     plan = None
     if plan_type in config.PLANS:
@@ -1557,7 +1557,7 @@ def handle_buy_now(call):
     user_id = call.from_user.id
     chat_id = call.message.chat.id
     msg_id = call.message.message_id
-    plan_type = call.data.split('_')[1]
+    plan_type = call.data[len("buy_"):]  # channel id me underscore ho sakta hai (ch_1234)
 
     if str(user_id) in pending_verifications:
         pending_data = pending_verifications[str(user_id)]
@@ -1893,6 +1893,16 @@ def handle_admin_files(message):
     user_id = message.from_user.id
     user_id_str = str(user_id)
 
+    # 0a. Admin channel-demo capture mode: jo bhi media aaye, seedha demo me add karo.
+    #     Album (4-5 media ek saath) me har media alag message aata hai, isliye sab add honge.
+    if is_admin(user_id) and _demo_capture_sessions.get(message.chat.id):
+        chan_id = _demo_capture_sessions[message.chat.id]
+        total = _demo_capture_append(message, chan_id)
+        if total:
+            bot.reply_to(message, f"✅ Demo me add — Total: <b>{total}</b>\nAur bhejein, ya ✅ Done dabayein.",
+                         parse_mode="HTML")
+        return
+
     # 0. NORMAL USER WITH PENDING → If they send DOCUMENT/VIDEO instead of PHOTO
     if not is_admin(user_id) and user_id_str in pending_verifications:
         pending_data = pending_verifications[user_id_str]
@@ -1958,6 +1968,28 @@ Aapne payment proof ko <b>File / Document / Video</b> ke roop mein bheja hai.
     if message.photo:
         if verif.handle_screenshot(message):
             return
+
+# Channel-demo capture: text/caption item, ya "done" likh ke bhi finish kar sakte hain
+@bot.message_handler(
+    func=lambda message: is_admin(message.from_user.id) and _demo_capture_sessions.get(message.chat.id) is not None,
+    content_types=['text']
+)
+def handle_demo_capture_text(message):
+    chan_id = _demo_capture_sessions.get(message.chat.id)
+    if not chan_id:
+        return
+    txt = (message.text or "").strip().lower()
+    if txt in ("/done", "done", "/finish"):
+        _demo_capture_sessions.pop(message.chat.id, None)
+        chan_demo_finish(message.chat.id, chan_id)
+        return
+    # Koi command (jaise /start) capture me add na ho
+    if (message.text or "").startswith('/'):
+        return
+    total = _demo_capture_append(message, chan_id)
+    if total:
+        bot.reply_to(message, f"✅ Demo me add — Total: <b>{total}</b>\nAur bhejein, ya ✅ Done dabayein.",
+                     parse_mode="HTML")
 
 # ========== VERIFICATION CALLBACKS ==========
 @bot.callback_query_handler(func=lambda call: call.data.startswith('verify_'))
@@ -2226,7 +2258,9 @@ def handle_admin_command(message):
         parse_mode="HTML"
     )
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('admin_'))
+@bot.callback_query_handler(func=lambda call: call.data.startswith((
+    'admin_', 'pay_', 'upi_set_', 'mode_toggle_', 'demo_set_', 'demo_toggle_'
+)))
 def handle_admin_callbacks(call):
     user_id = call.from_user.id
     if not is_admin(user_id):
@@ -2484,7 +2518,12 @@ def handle_admin_callbacks(call):
         msg = bot.send_message(call.message.chat.id, "Enter New Demo Channel ID:")
         bot.register_next_step_handler(msg, lambda m: update_setting(m, 'demo_channel_id', "Demo ID"))
 
-    bot.answer_callback_query(call.id)
+    # Synthetic CallbackQuery (id='0') se recursive calls bhi aate hain — un par
+    # answer_callback_query fail ho sakta hai, isliye safely ignore karo.
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
 
 def process_chan_edit(message, chan_id, field):
     val = message.text.strip()
@@ -2701,21 +2740,29 @@ def handle_channel_callbacks(call):
         if not action or not chan_id:
             bot.answer_callback_query(call.id, "⚠️ Channel not found", show_alert=True)
             return
+        # 'add' ke alawa koi bhi action = capture session khatam
+        if action != "add":
+            _demo_capture_sessions.pop(call.message.chat.id, None)
         if action == "menu":
             _safe_edit_text(call.message.chat.id, call.message.message_id,
                             chan_demo_menu_text(chan_id), chan_demo_menu_keyboard(chan_id))
         elif action == "add":
+            # Session capture mode: ab admin 4-5 media ek saath (album) bhej sakta hai,
+            # sab kuch is channel ke demo me automatically add hota rahega.
+            _demo_capture_sessions[call.message.chat.id] = chan_id
             try:
                 bot.delete_message(call.message.chat.id, call.message.message_id)
             except Exception:
                 pass
-            msg = bot.send_message(
+            bot.send_message(
                 call.message.chat.id,
-                "<b>🎬 Add Multiple Media</b>\n\nEk-ek karke video/photo bhejein — sab is channel ke demo me add honge.\nJab poora ho jaye to <b>✅ Done</b> dabayein.\n\n<i>Caption/text bhi bhej sakte hain.</i>",
+                "<b>🎬 Add Demo Media</b>\n\n"
+                "Ab <b>ek saath 4-5 photos/videos</b> (album) bhej dein — sab is channel ke demo me add ho jayenge.\n"
+                "Caption/text bhi bhej sakte hain.\n\n"
+                "Jab poora ho jaye to neeche <b>✅ Done</b> dabayein. Bas!",
                 reply_markup=chan_demo_done_keyboard(chan_id),
                 parse_mode="HTML"
             )
-            bot.register_next_step_handler(msg, chan_demo_capture, chan_id)
         elif action == "desc":
             try:
                 bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -2795,16 +2842,12 @@ def chan_demo_done_keyboard(chan_id):
     kb.add(types.InlineKeyboardButton("✅ Done", callback_data=f"chan_demo_done_{chan_id}", color="positive"))
     return kb
 
-def chan_demo_capture(message, chan_id):
-    """Multi-media add loop: har media/text is channel ke demo me append karo, phir agla wait karo."""
-    if not is_admin(message.from_user.id):
-        return
-    chat_id = message.chat.id
-    txt = (message.text or "").strip().lower()
-    if txt in ("/done", "done", "/finish"):
-        chan_demo_finish(chat_id, chan_id)
-        return
+# Per-admin channel-demo capture session: {chat_id: chan_id}
+# Jab tak Done na dabe, is admin ke saare bheje gaye media us channel ke demo me jaate hain.
+_demo_capture_sessions = {}
 
+def _demo_capture_append(message, chan_id):
+    """Message se media/text nikaal ke channel demo me append karo. Return: naya total (0 = kuch nahi mila)."""
     fid, ftype = _message_media_file_id(message)
     item = None
     if fid:
@@ -2812,27 +2855,19 @@ def chan_demo_capture(message, chan_id):
             mime = (message.document.mime_type or "") if message.document else ""
             ftype = 'photo' if 'image' in mime else 'video'
         item = {"id": fid, "type": ftype}
+        mid = _cache_file_id(fid, ftype)
+        if mid:
+            item['media_id'] = mid
     elif message.text:
         item = {"type": "text", "text": message.text}
 
     if not item:
-        msg = bot.send_message(chat_id, "⚠️ Video/photo/text bhejein, ya <b>✅ Done</b> dabayein.",
-                               reply_markup=chan_demo_done_keyboard(chan_id), parse_mode="HTML")
-        bot.register_next_step_handler(msg, chan_demo_capture, chan_id)
-        return
-
-    if item.get('type') != 'text':
-        mid = _cache_file_id(fid, item['type'])
-        if mid:
-            item['media_id'] = mid
+        return 0
 
     lst = settings.setdefault('plan_demo_videos', {}).setdefault(chan_id, [])
     lst.append(item)
     save_settings()
-    msg = bot.send_message(chat_id,
-                           f"✅ Added <b>{item.get('type')}</b> — Total: <b>{len(lst)}</b>\n\nAur bhejein, ya <b>✅ Done</b> dabayein.",
-                           reply_markup=chan_demo_done_keyboard(chan_id), parse_mode="HTML")
-    bot.register_next_step_handler(msg, chan_demo_capture, chan_id)
+    return len(lst)
 
 def chan_demo_desc_set(message, chan_id):
     if not is_admin(message.from_user.id):
