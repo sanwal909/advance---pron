@@ -75,21 +75,16 @@ def color_name_display(color_val):
     return str(color_val)
 
 def make_colored_button(text, **kwargs):
-    if 'url' not in kwargs and 'button_color' not in kwargs and 'color' not in kwargs:
-        color = get_random_button_color()
-        if color is not None:
-            kwargs['button_color'] = color
+    if 'url' not in kwargs:
+        # Force random premium color for all non-URL buttons
+        kwargs['button_color'] = get_random_button_color_nondefault()
     return types.InlineKeyboardButton(text, **kwargs)
 
 def make_channel_button(text, channel_color, **kwargs):
     if 'url' in kwargs:
         return types.InlineKeyboardButton(text, **kwargs)
-    if 'button_color' in kwargs or 'color' in kwargs:
-        return types.InlineKeyboardButton(text, **kwargs)
-    resolved = resolve_color(channel_color)
-    if resolved is None:
-        resolved = get_random_button_color_nondefault()
-    kwargs['button_color'] = resolved
+    # Ignore saved channel_color and force random
+    kwargs['button_color'] = get_random_button_color_nondefault()
     return types.InlineKeyboardButton(text, **kwargs)
 
 class VerificationSystem:
