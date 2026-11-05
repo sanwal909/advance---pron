@@ -12,48 +12,26 @@ from config import *
 
 logger = logging.getLogger(__name__)
 
-# ========== BUTTON COLOR FIX (API 7.0+ support) ==========
-_original_ikb_init_verif = types.InlineKeyboardButton.__init__
-def _patched_ikb_init_verif(self, *args, **kwargs):
-    color = kwargs.pop('color', None)
-    btn_color = kwargs.pop('button_color', None)
-    _original_ikb_init_verif(self, *args, **kwargs)
-    if color: self.color = color
-    if btn_color: self.button_color = btn_color
-types.InlineKeyboardButton.__init__ = _patched_ikb_init_verif
+# Verification System Helpers (Patches moved to bot.py for consolidation)
+BUTTON_COLORS = [None, "primary", "success", "danger"]
 
-_original_ikb_to_dict_verif = types.InlineKeyboardButton.to_dict
-def _patched_ikb_to_dict_verif(self):
-    json_dict = _original_ikb_to_dict_verif(self)
-    # Add button color if set (API 7.0+: primary, positive, negative)
-    color = getattr(self, 'button_color', None) or getattr(self, 'color', None)
-    if color:
-        # Resolve common names (blue -> primary, etc)
-        resolved = resolve_color(color)
-        if resolved in ["primary", "positive", "negative"]:
-            json_dict['color'] = resolved
-    return json_dict
-types.InlineKeyboardButton.to_dict = _patched_ikb_to_dict_verif
-
-BUTTON_COLORS = [None, "primary", "positive", "negative"]
-BUTTON_COLORS_NO_NONE = ["primary", "positive", "negative"]
 BUTTON_COLORS_CHOICE = {
     "blue": "primary",
-    "green": "positive",
-    "red": "negative",
+    "green": "success",
+    "red": "danger",
     "primary": "primary",
-    "positive": "positive",
-    "negative": "negative",
+    "positive": "success",
+    "negative": "danger",
+    "success": "success",
+    "danger": "danger",
     "default": None,
     "none": None,
     "": None,
 }
 
-def get_random_button_color():
-    return random.choice(BUTTON_COLORS)
-
 def get_random_button_color_nondefault():
-    return random.choice(BUTTON_COLORS_NO_NONE)
+    """Returns a random premium color (never None/white)"""
+    return random.choice(["primary", "success", "danger"])
 
 def resolve_color(color_val):
     if not color_val:
@@ -67,24 +45,24 @@ def color_name_display(color_val):
     if c is None:
         return "Default (White)"
     if c == "primary":
-        return "🔵 Blue (primary)"
-    if c == "positive":
-        return "🟢 Green (positive)"
-    if c == "negative":
-        return "🔴 Red (negative)"
+        return "Blue (primary)"
+    if c == "success":
+        return "Green (success)"
+    if c == "danger":
+        return "Red (danger)"
     return str(color_val)
 
 def make_colored_button(text, **kwargs):
     if 'url' not in kwargs:
         # Force random premium color for all non-URL buttons
-        kwargs['button_color'] = get_random_button_color_nondefault()
+        kwargs['style'] = get_random_button_color_nondefault()
     return types.InlineKeyboardButton(text, **kwargs)
 
 def make_channel_button(text, channel_color, **kwargs):
     if 'url' in kwargs:
         return types.InlineKeyboardButton(text, **kwargs)
     # Ignore saved channel_color and force random
-    kwargs['button_color'] = get_random_button_color_nondefault()
+    kwargs['style'] = get_random_button_color_nondefault()
     return types.InlineKeyboardButton(text, **kwargs)
 
 class VerificationSystem:
@@ -227,11 +205,12 @@ class VerificationSystem:
         demo_link = settings.get('demo_channel_link', '')
 
         if is_paid:
-            demo_color = settings.get('demo_color', '') or ''
-            btn = make_channel_button(f"📢 Free Video Channel (₹{demo_amount})", demo_color, callback_data="plan_demo")
+            btn = make_colored_button(f"📢 Free Video Channel (₹{demo_amount})", callback_data="plan_demo")
             keyboard.add(btn)
         elif demo_link:
             btn = types.InlineKeyboardButton("📢 Free Video Channel", url=demo_link)
+            # Add style for link buttons if supported by Telegram version
+            setattr(btn, 'button_style', get_random_button_color_nondefault())
             keyboard.add(btn)
         else:
             btn = make_colored_button("📢 Free Video Channel (Not Set)", callback_data="demo_not_set")
@@ -240,9 +219,8 @@ class VerificationSystem:
         # 2. Premium Channels (Directly shown)
         channels = settings.get("premium_channels", [])
         for ch in channels:
-            btn = make_channel_button(
+            btn = make_colored_button(
                 f"💎 {ch['name']} - ₹{ch['amount']}",
-                ch.get('color', ''),
                 callback_data=f"plan_{ch['id']}"
             )
             keyboard.add(btn)
@@ -252,6 +230,7 @@ class VerificationSystem:
             proof_link = settings.get('payment_proof_link', '')
             if proof_link:
                 btn = types.InlineKeyboardButton("🧾 Payment Proofs", url=proof_link)
+                setattr(btn, 'button_style', get_random_button_color_nondefault())
                 keyboard.add(btn)
             else:
                 btn = make_colored_button("🧾 Payment Proofs (Not Set)", callback_data="proof_not_set")
@@ -264,10 +243,15 @@ class VerificationSystem:
                 uname_clean = support_uname.lstrip('@')
                 support_url = f"https://t.me/{uname_clean}"
                 btn = types.InlineKeyboardButton("📞 Contact Support", url=support_url)
+                setattr(btn, 'button_style', get_random_button_color_nondefault())
                 keyboard.add(btn)
             else:
                 btn = make_colored_button("📞 Contact Support (Not Set)", callback_data="support_not_set")
                 keyboard.add(btn)
+
+        # 5. Empty Keyboard Protection (Ensure at least one button)
+        if len(keyboard.keyboard) == 0:
+            keyboard.add(types.InlineKeyboardButton("🔄 Refresh Menu", callback_data="main_menu"))
 
         return keyboard
     
