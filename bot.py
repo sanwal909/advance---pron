@@ -17,6 +17,16 @@ import config
 from config import *
 from verif import init_verification, make_colored_button, resolve_color, color_name_display, get_random_button_color_nondefault
 
+# Second payment option: In666/CQPAY "auto-pay" (pay2.py). Optional — bot manual
+# UPI/QR mode me bina iske bhi chalta rahega.
+try:
+    import pay2
+    PAY2_AVAILABLE = True
+except Exception as _pay2_err:
+    pay2 = None
+    PAY2_AVAILABLE = False
+    print(f"ℹ️ pay2 module not loaded ({type(_pay2_err).__name__}) — Auto-Pay disabled.")
+
 # Initialize bot — SAFE TOKEN VALIDATION & VERIFICATION
 # Priority: env var via config.BOT_TOKEN (loaded from .env)
 _token = getattr(config, 'BOT_TOKEN', os.getenv("BOT_TOKEN", ""))
@@ -910,6 +920,355 @@ class PremiumBot:
 
 premium_bot = PremiumBot()
 
+# ========== PAY2 (AUTO-PAY) HELPERS ==========
+def pay2_enabled():
+    """Auto-pay tabhi chale jab module loaded ho, mode ON ho aur account ho."""
+    return (PAY2_AVAILABLE
+            and settings.get('payment_gateway') == 'pay2'
+            and bool(settings.get('pay2_accounts')))
+
+
+def sync_pay2_accounts():
+    """settings ke pay2 accounts ko pay2 module me daalo (startup + har change par).
+    Active account count return karta hai."""
+    if not PAY2_AVAILABLE:
+        return 0
+    try:
+        return pay2.configure_accounts(settings.get('pay2_accounts', []) or [])
+    except Exception as e:
+        logging.error(f"pay2 configure_accounts failed: {type(e).__name__}")
+        return 0
+
+
+def _mask_secret(value, keep=4):
+    """Password jaisa secret log/message me dikhane se pehle mask karo."""
+    s = str(value or "")
+    if len(s) <= keep:
+        return "•" * len(s)
+    return "•" * (len(s) - keep) + s[-keep:]
+
+
+def _mask_proxy(url):
+    """Proxy URL ke credentials mask karo (password kabhi pura na dikhe)."""
+    s = str(url or "")
+    if "://" not in s:
+        return _mask_secret(s) if s else s
+    scheme, rest = s.split("://", 1)
+    if "@" in rest:
+        cred, host = rest.split("@", 1)
+        if ":" in cred:
+            user, pw = cred.split(":", 1)
+            cred = f"{user}:{_mask_secret(pw)}"
+        else:
+            cred = _mask_secret(cred)
+        return f"{scheme}://{cred}@{host}"
+    return s
+
+
+def sync_pay2_proxy():
+    """settings ka proxy override pay2 module me lagao. Effective URL return karta hai.
+
+    "" -> env/default; "off" -> disable; warna pura proxy URL.
+    """
+    if not PAY2_AVAILABLE:
+        return ""
+    val = str(settings.get('pay2_proxy', '') or "").strip()
+    try:
+        return pay2.set_proxy(val if val else None)
+    except Exception as e:
+        logging.error(f"pay2 set_proxy failed: {type(e).__name__}")
+        return ""
+
+
+def pay2_proxy_label():
+    """Panel me dikhane ke liye proxy ki short status line."""
+    if not PAY2_AVAILABLE:
+        return "❌ module load nahi hua"
+    val = str(settings.get('pay2_proxy', '') or "").strip().lower()
+    if val in ("off", "none", "no", "false", "0"):
+        return "🚫 Disabled"
+    try:
+        eff, source = pay2.proxy_status()
+    except Exception:
+        eff, source = "", "off"
+    if not eff:
+        return "🚫 Disabled"
+    tag = {"bot": "custom", "env": "env", "default": "default"}.get(source, source)
+    return f"✅ {_mask_proxy(eff)}  <i>({tag})</i>"
+
+
+def _normalize_proxy(raw):
+    """Admin ke input ko proxy URL me normalize karo. "" / "off" bhi handle."""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    low = s.lower()
+    if low in ("off", "none", "disable", "disabled", "no"):
+        return "off"
+    if "://" in s:
+        return s
+    if "@" in s:
+        return "http://" + s
+    parts = s.split(":")
+    if len(parts) == 4:  # host:port:user:pass
+        host, port, user, pw = parts
+        return f"http://{user}:{pw}@{host}:{port}"
+    if len(parts) == 2:  # host:port
+        return "http://" + s
+    return s
+
+
+def pay2_proxy_menu_text():
+    return (f"<b>🌐 AUTO-PAY PROXY</b>\n\n"
+            f"<b>Current:</b> {pay2_proxy_label()}\n\n"
+            f"Gateway (In666/CQPAY) ke saare calls isi proxy se jaate hain. "
+            f"India residential proxy recommended hai.\n\n"
+            f"• <b>Set/Change</b> — apna proxy URL dein (custom)\n"
+            f"• <b>Reset</b> — default/env par wapas\n"
+            f"• <b>Disable</b> — bina proxy direct connection")
+
+
+def pay2_proxy_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("✏️ Set / Change Proxy", callback_data="pay_proxy_set", color="primary"))
+    kb.add(types.InlineKeyboardButton("♻️ Reset to Default", callback_data="pay_proxy_reset", color="primary"))
+    kb.add(types.InlineKeyboardButton("🚫 Disable Proxy", callback_data="pay_proxy_disable", color="negative"))
+    kb.add(types.InlineKeyboardButton("⬅️ Back", callback_data="admin_pay"))
+    return kb
+
+
+def pay2_proxy_ask_url(message):
+    """Admin se proxy URL lo, normalize karke save + sync karo (creds message delete)."""
+    if not is_admin(message.from_user.id):
+        return
+    chat_id = message.chat.id
+    raw = (message.text or "").strip()
+    # Security: proxy credentials wala message turant delete karo
+    try:
+        bot.delete_message(chat_id, message.message_id)
+    except Exception:
+        pass
+
+    val = _normalize_proxy(raw)
+    if not val:
+        m = bot.send_message(chat_id, "❌ Proxy URL nahi mila. Panel se dobara try karein.", parse_mode="HTML")
+        track_msg(chat_id, m.message_id)
+        return
+
+    settings['pay2_proxy'] = val
+    save_settings()
+    effective = sync_pay2_proxy()
+
+    note = ("🚫 Proxy disable kar diya." if val == "off"
+            else f"✅ Proxy set ho gaya:\n<code>{_mask_proxy(effective)}</code>")
+    m = bot.send_message(chat_id, f"{note}\n\n{pay2_proxy_menu_text()}",
+                         reply_markup=pay2_proxy_keyboard(), parse_mode="HTML")
+    track_msg(chat_id, m.message_id)
+
+
+def notify_pay2_error(context, error):
+    """Auto-pay fail hone par admins ko chhota alert bhejo (secrets ke bina)."""
+    try:
+        msg = (f"⚠️ <b>AUTO-PAY ERROR</b>\n\nContext: {context}\n"
+               f"Reason: <code>{type(error).__name__}</code>")
+        for aid in settings.get('admin_ids', []):
+            try:
+                bot.send_message(aid, msg, parse_mode="HTML")
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+def pay2_utr_prompt(pv):
+    """UTR maangne wala prompt text (order details ke saath)."""
+    order_num = (pv or {}).get('order_number', 'N/A')
+    amount = (pv or {}).get('amount', '')
+    return (
+        f"⏳ <b>PAYMENT ABHI RECEIVE NAHI HUI (Order #{order_num})</b>\n\n"
+        f"Agar aapne <b>₹{amount}</b> pay kar diya hai to apna "
+        f"<b>UTR / Reference Number</b> (12-digit) yaha bhejein — "
+        f"main third-party site par verify kar dunga.\n\n"
+        f"📸 <i>Ya payment ka screenshot PHOTO ke roop me bhejein (manual verification).</i>"
+    )
+
+
+def pay2_verify_success(chat_id, user_id, source):
+    """Auto-verify hui order ko wahi path se complete karo jo admin verify use karta hai
+    (join link + sale record + premium flag)."""
+    try:
+        ok, _ = verif.verify_payment(str(user_id), "AUTO-PAY")
+    except Exception as e:
+        logging.error(f"pay2 auto-verify failed: {type(e).__name__}")
+        ok = False
+    if ok:
+        try:
+            m = bot.send_message(
+                chat_id,
+                f"🎉 <b>PAYMENT AUTO-VERIFIED!</b>\n\n{source}\n"
+                f"Aapka order confirm ho gaya — join link upar bhej diya gaya hai.",
+                parse_mode="HTML"
+            )
+            track_msg(chat_id, m.message_id)
+        except Exception:
+            pass
+    return ok
+
+
+def pay2_auto_verify(chat_id, user_id):
+    """Payment Done par: pehle get_info se status check -> paid ho to verify,
+    warna user se UTR maango. Background thread se chalta hai."""
+    pv = pending_verifications.get(str(user_id))
+    if not pv:
+        return
+
+    token = pv.get('pay2_token')
+    plan_type = pv.get('plan')
+
+    # pay2 token nahi (manual flow) -> purana screenshot flow
+    if not token:
+        screenshot_msg = verif.ask_for_screenshot(chat_id, user_id, plan_type)
+        if screenshot_msg:
+            track_msg(chat_id, screenshot_msg.message_id)
+        return
+
+    note = None
+    try:
+        note = bot.send_message(chat_id, "🔎 <b>Payment check kar raha hoon...</b>", parse_mode="HTML")
+        track_msg(chat_id, note.message_id)
+    except Exception:
+        note = None
+
+    paid = False
+    try:
+        paid = pay2.is_paid(pay2.check_payment(token))
+    except Exception as e:
+        logging.error(f"pay2 check_payment error: {type(e).__name__}")
+
+    if paid:
+        if note:
+            try:
+                bot.delete_message(chat_id, note.message_id)
+            except Exception:
+                pass
+            if note.message_id in user_all_messages.get(str(chat_id), []):
+                user_all_messages[str(chat_id)].remove(note.message_id)
+        pay2_verify_success(chat_id, user_id, "Gateway ne payment confirm kar di.")
+        return
+
+    # Payment abhi confirm nahi -> UTR maango
+    text = pay2_utr_prompt(pv)
+    prompt_msg = None
+    if note:
+        try:
+            bot.edit_message_text(text, chat_id=chat_id, message_id=note.message_id, parse_mode="HTML")
+            prompt_msg = note
+        except Exception:
+            prompt_msg = None
+    if prompt_msg is None:
+        try:
+            prompt_msg = bot.send_message(chat_id, text, parse_mode="HTML")
+            track_msg(chat_id, prompt_msg.message_id)
+        except Exception:
+            return
+    bot.register_next_step_handler(prompt_msg, pay2_handle_utr)
+
+
+def pay2_handle_utr(message):
+    """User ka UTR lo -> refshjsas se verify -> status re-check -> verify ya screenshot fallback."""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    pv = pending_verifications.get(str(user_id))
+    if not pv or not pv.get('pay2_token'):
+        return
+
+    # User ne UTR ki jagah screenshot bhej diya -> manual verification
+    if message.photo:
+        verif.handle_screenshot(message)
+        return
+
+    utr = (message.text or "").strip()
+    if not utr or utr.startswith('/'):
+        m = bot.send_message(
+            chat_id,
+            "❌ UTR number sahi se bhejein (jaise <code>100121212121</code>).",
+            parse_mode="HTML"
+        )
+        track_msg(chat_id, m.message_id)
+        bot.register_next_step_handler(m, pay2_handle_utr)
+        return
+
+    token = pv['pay2_token']
+    paid = False
+    try:
+        pay2.submit_utr(token, utr)
+        paid = pay2.is_paid(pay2.check_payment(token))
+    except Exception as e:
+        logging.error(f"pay2 submit_utr error: {type(e).__name__}")
+
+    if paid:
+        pay2_verify_success(chat_id, user_id, f"UTR <code>{utr}</code> verify ho gaya.")
+        return
+
+    # Fallback: manual screenshot verification (admin)
+    m = bot.send_message(
+        chat_id,
+        "⚠️ <b>Auto-verify nahi ho paya.</b>\n\n"
+        "Kripya payment ka <b>screenshot PHOTO</b> ke roop me bhejein — admin manually verify karega.",
+        parse_mode="HTML"
+    )
+    track_msg(chat_id, m.message_id)
+    screenshot_msg = verif.ask_for_screenshot(chat_id, user_id, pv.get('plan'))
+    if screenshot_msg:
+        track_msg(chat_id, screenshot_msg.message_id)
+
+
+def pay2_show_balance(chat_id, msg_id=None):
+    """Admin ke liye har account ka latest balance dikhao (background thread)."""
+    if not PAY2_AVAILABLE:
+        text = "❌ pay2 module load nahi hua (pycryptodome install karein)."
+    else:
+        rows = []
+        try:
+            rows = pay2.get_balances(fresh=True)
+        except Exception as e:
+            logging.error(f"pay2 get_balances error: {type(e).__name__}")
+        if not rows:
+            text = ("<b>💰 AUTO-PAY BALANCES</b>\n\n"
+                    "Koi account configured nahi hai ya fetch fail ho gaya.")
+        else:
+            lines = []
+            for r in rows:
+                phone = r.get('phone', '?')
+                bal = r.get('balance')
+                if bal is None:
+                    bal_txt = f"⚠️ fail ({r.get('error', 'unknown')})"
+                else:
+                    bal_txt = f"₹{bal:,.2f}"
+                lines.append(f"• <code>{phone}</code> — <b>{bal_txt}</b>")
+            text = "<b>💰 AUTO-PAY BALANCES</b>\n\n" + "\n".join(lines)
+
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("🔄 Refresh", callback_data="pay_balance", color="primary"))
+    kb.add(types.InlineKeyboardButton("⬅️ Back", callback_data="admin_pay", color="primary"))
+    try:
+        if msg_id:
+            bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id,
+                                  reply_markup=kb, parse_mode="HTML")
+        else:
+            bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+
+
+if PAY2_AVAILABLE:
+    sync_pay2_proxy()
+    _pay2_active = sync_pay2_accounts()
+    if _pay2_active:
+        print(f"✅ pay2 (Auto-Pay): {_pay2_active} account(s) configured.")
+    elif settings.get('payment_gateway') == 'pay2':
+        print("⚠️ Auto-Pay ON hai par koi pay2 account configured nahi — manual UPI/QR use hoga.")
+
 # ========== IMPORTANT LOGS ==========
 def log_important_event(event_type, user_data=None, plan=None):
     try:
@@ -1236,18 +1595,23 @@ Jab tak admin purane payment ko verify/reject nahi kar dete, aap naya payment cr
         bot.answer_callback_query(call.id, "❌ Plan not found!", show_alert=True)
         return
 
-    # Generate QR FIRST — fail fast (and cleanly) if this plan's amount is invalid,
-    # instead of raising an error later and leaving a broken order.
-    qr_image = premium_bot.generate_qr_code(settings['upi_id'], plan['amount'], settings['upi_name'])
-    if qr_image is None:
-        logging.error(f"Order blocked: invalid amount for plan {plan_type}: {plan['amount']!r}")
-        bot.answer_callback_query(
-            call.id,
-            "⚠️ Payment QR is unavailable for this plan.\n"
-            "Admin: plan ka amount sahi karo (sirf number, jaise 100).",
-            show_alert=True
-        )
-        return
+    # Auto-Pay mode ON hai to gateway se payment link; warna manual UPI/QR.
+    use_pay2 = pay2_enabled()
+
+    qr_image = None
+    if not use_pay2:
+        # Generate QR FIRST — fail fast (and cleanly) if this plan's amount is invalid,
+        # instead of raising an error later and leaving a broken order.
+        qr_image = premium_bot.generate_qr_code(settings['upi_id'], plan['amount'], settings['upi_name'])
+        if qr_image is None:
+            logging.error(f"Order blocked: invalid amount for plan {plan_type}: {plan['amount']!r}")
+            bot.answer_callback_query(
+                call.id,
+                "⚠️ Payment QR is unavailable for this plan.\n"
+                "Admin: plan ka amount sahi karo (sirf number, jaise 100).",
+                show_alert=True
+            )
+            return
 
     settings['total_orders'] = settings.get('total_orders', 0) + 1
     order_num = settings['total_orders']
@@ -1261,6 +1625,23 @@ Jab tak admin purane payment ko verify/reject nahi kar dete, aap naya payment cr
         'username': call.from_user.username,
         'first_name': call.from_user.first_name
     }
+
+    try:
+        bot.delete_message(chat_id, msg_id)
+    except: pass
+    if msg_id in user_all_messages.get(str(chat_id), []):
+        user_all_messages[str(chat_id)].remove(msg_id)
+
+    if use_pay2:
+        # Link banane me kuch second lag sakte hain — callback turant answer karo
+        # aur kaam background thread me karo (UI block na ho).
+        bot.answer_callback_query(call.id, "⏳ Secure payment link ban raha hai...")
+        threading.Thread(
+            target=send_pay2_payment,
+            args=(chat_id, user_id, plan_type, plan['amount'], plan['name'], order_num),
+            daemon=True
+        ).start()
+        return
 
     caption = f"""
 <b>💰 ORDER #{order_num}: PAY ₹{plan['amount']} FOR {plan['name'].upper()}</b>
@@ -1286,12 +1667,6 @@ Please use any other UPI app (PhonePe, Paytm, BHIM, etc.) for payment.
     btn2 = make_button("🔙 Back", callback_data=f"plan_{plan_type}")
     keyboard.add(btn1, btn2)
 
-    try:
-        bot.delete_message(chat_id, msg_id)
-    except: pass
-    if msg_id in user_all_messages.get(str(chat_id), []):
-        user_all_messages[str(chat_id)].remove(msg_id)
-
     if qr_image:
         sent_msg = bot.send_photo(chat_id, photo=qr_image, caption=caption, reply_markup=keyboard, parse_mode="HTML")
         track_msg(chat_id, sent_msg.message_id)
@@ -1302,6 +1677,84 @@ Please use any other UPI app (PhonePe, Paytm, BHIM, etc.) for payment.
         delete_message_after_delay(chat_id, sent_msg.message_id, 600, send_timeout_msg=True)
 
     bot.answer_callback_query(call.id)
+
+def send_pay2_payment(chat_id, user_id, plan_type, amount, plan_name, order_num):
+    """Auto-Pay: pay2.py se payment link banao aur user ko button ke saath bhejo.
+    Background thread se chalta hai (network call slow ho sakti hai)."""
+    placeholder = None
+    try:
+        placeholder = bot.send_message(
+            chat_id,
+            "⏳ <b>Secure payment link ban raha hai...</b>\n<i>Please wait thodi der...</i>",
+            parse_mode="HTML"
+        )
+        track_msg(chat_id, placeholder.message_id)
+    except Exception:
+        placeholder = None
+
+    try:
+        res = pay2.get_payment_url(amount)
+        url = res.get("url")
+        if not url:
+            raise RuntimeError("paysubmit ne URL nahi diya")
+    except Exception as e:
+        logging.error(f"pay2 order failed (plan={plan_type}, amount={amount}): {type(e).__name__}")
+        # Failed order → pending entry hata do taaki user dobara try kar sake
+        pending_verifications.pop(str(user_id), None)
+        fail_text = ("❌ <b>Payment link generate nahi ho paya.</b>\n\n"
+                     "Thodi der baad dobara koshish karein. Admin ko alert bhej diya gaya hai.")
+        try:
+            if placeholder:
+                bot.edit_message_text(fail_text, chat_id=chat_id,
+                                      message_id=placeholder.message_id, parse_mode="HTML")
+            else:
+                bot.send_message(chat_id, fail_text, parse_mode="HTML")
+        except Exception:
+            pass
+        notify_pay2_error(f"plan={plan_type}, amount={amount}", e)
+        return
+
+    order_no = res.get("orderNo") or order_num
+    # Auto-verify ke liye gateway token/URL pending order me save karo
+    pv = pending_verifications.get(str(user_id))
+    if pv is not None:
+        pv['pay2_url'] = url
+        pv['pay2_token'] = pay2.pay_token(url)
+        pv['pay2_order_no'] = res.get("orderNo") or ""
+        pending_verifications[str(user_id)] = pv
+
+    text = f"""
+<b>💰 ORDER #{order_num}: PAY ₹{amount} FOR {plan_name.upper()}</b>
+
+✅ <b>Secure payment link ready hai.</b>
+
+<b>Instructions:</b>
+1. Neeche <b>💳 Pay Now</b> button dabao
+2. Payment page par ₹{amount} pay karo
+3. Wapas aake <b>✅ Payment Done</b> dabao
+
+<b>Gateway Order:</b> <code>{order_no}</code>
+
+⏳ <i>Ye link 10 minute me auto-delete ho jayega.</i>
+    """
+
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    # URL button par Telegram color support nahi karta
+    keyboard.add(types.InlineKeyboardButton("💳 Pay Now", url=url))
+    keyboard.add(make_button("✅ Payment Done", callback_data="payment_done"))
+    keyboard.add(make_button("🔙 Back", callback_data=f"plan_{plan_type}"))
+
+    if placeholder:
+        try:
+            bot.edit_message_text(text, chat_id=chat_id, message_id=placeholder.message_id,
+                                  reply_markup=keyboard, parse_mode="HTML")
+            delete_message_after_delay(chat_id, placeholder.message_id, 600)
+            return
+        except Exception:
+            pass
+    m = bot.send_message(chat_id, text, reply_markup=keyboard, parse_mode="HTML")
+    track_msg(chat_id, m.message_id)
+    delete_message_after_delay(chat_id, m.message_id, 600)
 
 @bot.callback_query_handler(func=lambda call: call.data == "back_to_main")
 def handle_back_to_main(call):
@@ -1412,7 +1865,14 @@ def handle_payment_done(call):
     if msg_id in user_all_messages.get(str(chat_id), []):
         user_all_messages[str(chat_id)].remove(msg_id)
 
-    screenshot_msg = verif.ask_for_screenshot(chat_id, user_id, pending_verifications[str(user_id)]['plan'])
+    pv = pending_verifications[str(user_id)]
+    # pay2 order -> pehle auto-verify (get_info); warna purana manual screenshot flow
+    if PAY2_AVAILABLE and pv.get('pay2_token'):
+        bot.answer_callback_query(call.id, "🔎 Payment check kar raha hoon...")
+        threading.Thread(target=pay2_auto_verify, args=(chat_id, user_id), daemon=True).start()
+        return
+
+    screenshot_msg = verif.ask_for_screenshot(chat_id, user_id, pv['plan'])
     if screenshot_msg:
         track_msg(chat_id, screenshot_msg.message_id)
 
@@ -1670,6 +2130,44 @@ Order successfully cancel ho gaya. Naya order create karne ke liye /start use ka
 
 # ========== /SETTINGS COMMAND (FIXED HTML) ==========
 # ========== ADMIN PANEL (Button Based) ==========
+def pay2_menu_keyboard():
+    on = settings.get('payment_gateway') == 'pay2'
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton(
+        f"💳 Auto-Pay: {'ON ✅' if on else 'OFF ❌'}",
+        callback_data="pay_toggle",
+        color="positive" if on else "negative"
+    ))
+    kb.add(types.InlineKeyboardButton("➕ Add Account", callback_data="pay_add_acc", color="primary"))
+    kb.add(types.InlineKeyboardButton(
+        f"📋 List Accounts ({len(settings.get('pay2_accounts', []))})",
+        callback_data="pay_list_acc", color="primary"
+    ))
+    kb.add(types.InlineKeyboardButton("💰 Balance / Orders", callback_data="pay_balance", color="positive"))
+    kb.add(types.InlineKeyboardButton("🌐 Proxy Settings", callback_data="pay_proxy", color="primary"))
+    kb.add(types.InlineKeyboardButton("🗑 Clear All Accounts", callback_data="pay_clear_acc", color="negative"))
+    kb.add(types.InlineKeyboardButton("⬅️ Back to Menu", callback_data="admin_main"))
+    return kb
+
+
+def pay2_menu_text():
+    accounts = settings.get('pay2_accounts', [])
+    if not PAY2_AVAILABLE:
+        status = "❌ module load nahi hua (pycryptodome install karein)"
+    elif settings.get('payment_gateway') == 'pay2' and not accounts:
+        status = "⚠️ ON hai par koi account nahi — manual UPI/QR fallback chalega"
+    else:
+        status = "ON ✅" if settings.get('payment_gateway') == 'pay2' else "OFF (manual UPI/QR)"
+    return (f"<b>💳 AUTO-PAY (pay2) SETTINGS</b>\n\n"
+            f"<b>Mode:</b> {status}\n"
+            f"<b>Accounts:</b> {len(accounts)}\n"
+            f"<b>Proxy:</b> {pay2_proxy_label()}\n\n"
+            f"ON hone par users ko gateway ka <b>payment link</b> milega "
+            f"(manual UPI/QR OFF). OFF karne par purana UPI/QR flow chalu rahega.\n\n"
+            f"<b>Add Account:</b> phone country code ke saath, jaise "
+            f"<code>+91-9XXXXXXXXX</code>")
+
+
 def admin_menu_keyboard():
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     
@@ -1685,7 +2183,12 @@ def admin_menu_keyboard():
         types.InlineKeyboardButton("📊 Stats & Sales", callback_data="admin_stats", color="positive")
     )
     
-    # Row 3: Admin & Modes
+    # Row 3: Auto-Pay gateway (pay2)
+    keyboard.add(
+        types.InlineKeyboardButton("💳 Auto-Pay (pay2)", callback_data="admin_pay", color="primary")
+    )
+
+    # Row 4: Admin & Modes
     keyboard.add(
         types.InlineKeyboardButton("👑 Admin Mgmt", callback_data="admin_users", color="negative"),
         types.InlineKeyboardButton("🔐 Bot Modes", callback_data="admin_modes", color="negative")
@@ -1769,6 +2272,140 @@ def handle_admin_callbacks(call):
     elif data == "upi_set_name":
         msg = bot.send_message(call.message.chat.id, "Enter New UPI Name:")
         bot.register_next_step_handler(msg, lambda m: update_setting(m, 'upi_name', "UPI Name"))
+
+    elif data == "admin_pay":
+        bot.edit_message_text(
+            pay2_menu_text(),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=pay2_menu_keyboard(),
+            parse_mode="HTML"
+        )
+
+    elif data == "pay_toggle":
+        if not PAY2_AVAILABLE:
+            bot.answer_callback_query(call.id, "❌ pay2 module load nahi hua (pycryptodome install karein)", show_alert=True)
+            return
+        turning_on = settings.get('payment_gateway') != 'pay2'
+        if turning_on and not settings.get('pay2_accounts'):
+            bot.answer_callback_query(call.id, "⚠️ Pehle kam-se-kam ek account add karein.", show_alert=True)
+            return
+        settings['payment_gateway'] = 'pay2' if turning_on else 'manual'
+        save_settings()
+        sync_pay2_accounts()
+        bot.edit_message_text(
+            pay2_menu_text(),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=pay2_menu_keyboard(),
+            parse_mode="HTML"
+        )
+
+    elif data == "pay_add_acc":
+        msg = bot.send_message(
+            call.message.chat.id,
+            "<b>➕ Add Auto-Pay Account</b>\n\nEnter Phone (country code ke saath, e.g. <code>+91-9XXXXXXXXX</code>):",
+            parse_mode="HTML"
+        )
+        bot.register_next_step_handler(msg, pay2_ask_password)
+
+    elif data == "pay_list_acc":
+        accounts = settings.get('pay2_accounts', [])
+        if not accounts:
+            bot.answer_callback_query(call.id, "Koi account configured nahi hai.", show_alert=True)
+            return
+        lines = [f"{i}. <code>{a.get('phone','')}</code> — 🔑 <code>{_mask_secret(a.get('password',''))}</code>"
+                 for i, a in enumerate(accounts, 1)]
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("⬅️ Back", callback_data="admin_pay"))
+        bot.edit_message_text(
+            "<b>📋 AUTO-PAY ACCOUNTS</b>\n\n" + "\n".join(lines) + "\n\n<i>Passwords masked hain.</i>",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+
+    elif data == "pay_balance":
+        try:
+            bot.edit_message_text(
+                "⏳ <b>Balance check ho raha hai...</b>\n<i>Gateway se fresh balance aa raha hai...</i>",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+        threading.Thread(
+            target=pay2_show_balance,
+            args=(call.message.chat.id, call.message.message_id),
+            daemon=True
+        ).start()
+        bot.answer_callback_query(call.id)
+
+    elif data == "pay_proxy":
+        bot.edit_message_text(
+            pay2_proxy_menu_text(),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=pay2_proxy_keyboard(),
+            parse_mode="HTML"
+        )
+        bot.answer_callback_query(call.id)
+
+    elif data == "pay_proxy_set":
+        msg = bot.edit_message_text(
+            "🌐 <b>PROXY SET KARO</b>\n\n"
+            "Poora proxy URL bhejein, jaise:\n"
+            "<code>http://user:pass@host:port</code>\n\n"
+            "• Bare format bhi chalega: <code>host:port:user:pass</code>\n"
+            "• SOCKS5: <code>socks5://user:pass@host:port</code>\n"
+            "• Aapka ye message security ke liye turant delete ho jayega.",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode="HTML"
+        )
+        bot.register_next_step_handler(msg, pay2_proxy_ask_url)
+        bot.answer_callback_query(call.id)
+
+    elif data == "pay_proxy_disable":
+        settings['pay2_proxy'] = 'off'
+        save_settings()
+        sync_pay2_proxy()
+        bot.edit_message_text(
+            pay2_proxy_menu_text(),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=pay2_proxy_keyboard(),
+            parse_mode="HTML"
+        )
+        bot.answer_callback_query(call.id, "🚫 Proxy disabled")
+
+    elif data == "pay_proxy_reset":
+        settings['pay2_proxy'] = ''
+        save_settings()
+        sync_pay2_proxy()
+        bot.edit_message_text(
+            pay2_proxy_menu_text(),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=pay2_proxy_keyboard(),
+            parse_mode="HTML"
+        )
+        bot.answer_callback_query(call.id, "♻️ Default par reset")
+
+    elif data == "pay_clear_acc":
+        settings['pay2_accounts'] = []
+        settings['payment_gateway'] = 'manual'
+        save_settings()
+        sync_pay2_accounts()
+        bot.edit_message_text(
+            pay2_menu_text(),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=pay2_menu_keyboard(),
+            parse_mode="HTML"
+        )
 
     elif data == "admin_stats":
         total_users = len(users_data)
@@ -1896,6 +2533,130 @@ def update_setting(message, key, name):
     settings[key] = message.text.strip()
     save_settings()
     bot.send_message(message.chat.id, f"✅ {name} updated to: <code>{settings[key]}</code>", parse_mode="HTML")
+
+# ========== AUTO-PAY (pay2) ACCOUNT ADD FLOW ==========
+def pay2_ask_password(message):
+    """Step 1 (phone) mil gaya → ab password maango."""
+    phone = (message.text or "").strip()
+    if " " in phone or len(phone) < 6 or len(phone) > 20:
+        bot.reply_to(message, "❌ Invalid phone. Format: <code>+91-9XXXXXXXXX</code>\nDubara <b>➕ Add Account</b> se try karein.", parse_mode="HTML")
+        return
+    msg = bot.send_message(
+        message.chat.id,
+        f"<b>Phone:</b> <code>{phone}</code>\n\nEnter Password:",
+        parse_mode="HTML"
+    )
+    bot.register_next_step_handler(msg, pay2_save_account, phone)
+
+
+def pay2_save_account(message, phone):
+    """Step 2 (password) → account save karo aur password wala message delete karo."""
+    password = (message.text or "").strip()
+    # Security: password wala message turant delete kar do
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+    except Exception:
+        pass
+    if not password:
+        bot.send_message(message.chat.id, "❌ Password khaali tha. Dubara <b>➕ Add Account</b> se try karein.", parse_mode="HTML")
+        return
+
+    accounts = [a for a in settings.get('pay2_accounts', []) if a.get('phone') != phone]
+    accounts.append({"phone": phone, "password": password})
+    settings['pay2_accounts'] = accounts
+    save_settings()
+    active = sync_pay2_accounts()
+
+    bot.send_message(
+        message.chat.id,
+        f"✅ <b>Account added!</b>\n\n"
+        f"<b>Phone:</b> <code>{phone}</code>\n"
+        f"<b>Password:</b> <code>{_mask_secret(password)}</code>\n"
+        f"<b>Active accounts:</b> {active}\n\n"
+        f"Auto-Pay ON karne ke liye <code>/pay2</code> khol kar toggle karein.",
+        parse_mode="HTML"
+    )
+
+
+# ========== /PAY2 COMMANDS (AUTO-PAY GATEWAY) ==========
+@bot.message_handler(commands=['pay2'])
+def handle_pay2_command(message):
+    if not is_admin(message.from_user.id):
+        return
+    bot.reply_to(message, pay2_menu_text(), reply_markup=pay2_menu_keyboard(), parse_mode="HTML")
+
+
+@bot.message_handler(commands=['pay2_toggle'])
+def handle_pay2_toggle(message):
+    if not is_admin(message.from_user.id):
+        return
+    if not PAY2_AVAILABLE:
+        bot.reply_to(message, "❌ pay2 module load nahi hua. <code>pip install pycryptodome</code> karke restart karein.", parse_mode="HTML")
+        return
+    turning_on = settings.get('payment_gateway') != 'pay2'
+    if turning_on and not settings.get('pay2_accounts'):
+        bot.reply_to(message, "⚠️ Pehle kam-se-kam ek account add karein: <code>/pay2_add</code>", parse_mode="HTML")
+        return
+    settings['payment_gateway'] = 'pay2' if turning_on else 'manual'
+    save_settings()
+    sync_pay2_accounts()
+    bot.reply_to(message, f"✅ Auto-Pay ab <b>{'ON' if turning_on else 'OFF'}</b>.", parse_mode="HTML")
+
+
+@bot.message_handler(commands=['pay2_add'])
+def handle_pay2_add(message):
+    if not is_admin(message.from_user.id):
+        return
+    msg = bot.send_message(
+        message.chat.id,
+        "<b>➕ Add Auto-Pay Account</b>\n\nEnter Phone (e.g. <code>+91-9XXXXXXXXX</code>):",
+        parse_mode="HTML"
+    )
+    bot.register_next_step_handler(msg, pay2_ask_password)
+
+
+@bot.message_handler(commands=['pay2_list'])
+def handle_pay2_list(message):
+    if not is_admin(message.from_user.id):
+        return
+    accounts = settings.get('pay2_accounts', [])
+    if not accounts:
+        bot.reply_to(message, "ℹ️ Koi account configured nahi hai. <code>/pay2_add</code> se add karein.", parse_mode="HTML")
+        return
+    lines = [f"{i}. <code>{a.get('phone','')}</code> — 🔑 <code>{_mask_secret(a.get('password',''))}</code>"
+             for i, a in enumerate(accounts, 1)]
+    bot.reply_to(message, "<b>📋 AUTO-PAY ACCOUNTS</b>\n\n" + "\n".join(lines) + "\n\n<i>Passwords masked hain.</i>", parse_mode="HTML")
+
+
+@bot.message_handler(commands=['pay2_clear'])
+def handle_pay2_clear(message):
+    if not is_admin(message.from_user.id):
+        return
+    settings['pay2_accounts'] = []
+    settings['payment_gateway'] = 'manual'
+    save_settings()
+    sync_pay2_accounts()
+    bot.reply_to(message, "✅ Saare Auto-Pay accounts clear kar diye aur mode OFF kar diya.")
+
+
+@bot.message_handler(commands=['pay2_balance'])
+def handle_pay2_balance(message):
+    if not is_admin(message.from_user.id):
+        return
+    m = bot.send_message(message.chat.id, "⏳ <b>Balance check ho raha hai...</b>", parse_mode="HTML")
+    threading.Thread(target=pay2_show_balance, args=(message.chat.id, m.message_id), daemon=True).start()
+
+
+@bot.message_handler(commands=['pay2_proxy'])
+def handle_pay2_proxy(message):
+    if not is_admin(message.from_user.id):
+        return
+    bot.send_message(
+        message.chat.id,
+        pay2_proxy_menu_text(),
+        reply_markup=pay2_proxy_keyboard(),
+        parse_mode="HTML"
+    )
 
 # ========== CHANNEL MANAGEMENT FLOWS ==========
 @bot.callback_query_handler(func=lambda call: call.data.startswith('chan_'))
@@ -4181,6 +4942,22 @@ Use: <code>/set [key] [value]</code>
       user <b>join request</b> bhejega, aur <b>aap Approve/Decline</b> karenge
       (tabhi user channel me add hoga)
     → <b>OFF:</b> pehle jaise <b>direct one-time link</b> (member_limit=1)
+
+━━━━━━━━━━━━━━━
+<b>🔹 AUTO-PAY (pay2) GATEWAY:</b>
+/pay2        - 💳 Auto-Pay panel (ON/OFF + accounts), button based
+/pay2_toggle - 🔁 Manual UPI/QR ⇄ Gateway payment link
+    → <b>ON:</b> user ko gateway ka <b>payment link</b> button milega
+    → <b>OFF:</b> purana manual UPI/QR + screenshot flow
+/pay2_add    - ➕ Account add (step-by-step: phone → password)
+/pay2_list   - 📋 Accounts list (passwords masked)
+/pay2_balance- 💰 Har account ka latest balance (fresh gateway login)
+/pay2_proxy  - 🌐 Proxy set/change/reset/disable (bot panel se, restart ke bina)
+/pay2_clear  - 🗑 Saare accounts clear + mode OFF
+    → <b>Phone format:</b> <code>+91-9XXXXXXXXX</code> (country code zaruri)
+    → Accounts round-robin rotate hote hain, fail par auto-switch
+    → Saare calls India residential proxy se jaate hain (panel se set karo ya PAY2_PROXY env var)
+    → Payment Done par: gateway se <b>auto-verify</b>; na ho to UTR (refNo) se verify
 
 ━━━━━━━━━━━━━━━
 <b>🔹 PREMIUM CHANNEL MANAGEMENT:</b>
