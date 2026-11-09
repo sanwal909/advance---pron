@@ -570,7 +570,18 @@ You'll receive unique join link within few minutes.
                     )
                 except Exception as e:
                     logger.error(f"Proof channel error: {e}")
-            
+
+            # ---- Broadcast purchase proof to ALL users (auto-delete after 12h) ----
+            try:
+                self._broadcast_purchase_proof(
+                    user_id=user_id,
+                    plan=plan,
+                    order_num=order_num,
+                    screenshot_file_id=pending_data.get('screenshot_file_id', ''),
+                )
+            except Exception as e:
+                logger.error(f"Purchase proof broadcast error: {type(e).__name__}: {e}")
+
             # Update user data to mark as premium
             if user_id in users_data:
                 users_data[user_id]['is_premium'] = True
@@ -591,7 +602,80 @@ You'll receive unique join link within few minutes.
         except Exception as e:
             logger.error(f"Error sending join link: {e}")
             return False, f"Error sending message: {str(e)}"
-    
+
+    def _broadcast_purchase_proof(self, user_id, plan, order_num, screenshot_file_id):
+        """Broadcast the verified payment proof to ALL bot users.
+        Message: screenshot + bought content + time/date + Buy Now buttons for all channels.
+        Auto-deletes after 12 hours."""
+        plan_name = (plan or {}).get('name', 'Premium')
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        caption = (
+            f"🔥 <b>NEW PURCHASE SUCCESS!</b> 🔥\n\n"
+            f"Someone just bought <b>{self._html_escape(plan_name)}</b> and got instant access! 🚀\n"
+            f"⏰ <b>Date:</b> {now_str}\n\n"
+            f"👇 <b>Buy Now to get your access:</b>"
+        )
+
+        # Buy Now buttons for ALL premium channels (admin-set)
+        keyboard = types.InlineKeyboardMarkup(row_width=1)
+        channels = settings.get("premium_channels", [])
+        for ch in channels:
+            btn = make_channel_button(
+                f"Buy {ch.get('name', 'Channel')} — ₹{ch.get('amount', '')}",
+                ch.get('color', ''),
+                callback_data=f"plan_{ch.get('id')}"
+            )
+            keyboard.add(btn)
+
+        AUTO_DELAY = 12 * 3600  # 12 hours
+
+        def _worker():
+            sent = 0
+            failed = 0
+            for uid_str in list(users_data.keys()):
+                try:
+                    uid = int(uid_str)
+                    if screenshot_file_id:
+                        m = self.bot.send_photo(
+                            uid,
+                            photo=screenshot_file_id,
+                            caption=caption,
+                            reply_markup=keyboard,
+                            parse_mode="HTML",
+                        )
+                    else:
+                        m = self.bot.send_message(
+                            uid,
+                            caption,
+                            reply_markup=keyboard,
+                            parse_mode="HTML",
+                        )
+                    # Schedule auto-delete after 12h
+                    t = threading.Timer(AUTO_DELAY, lambda c=uid, mid=m.message_id: self._safe_delete(c, mid))
+                    t.daemon = True
+                    t.start()
+                    sent += 1
+                    time.sleep(0.05)
+                except Exception as e:
+                    failed += 1
+                    err = str(e).lower()
+                    if "forbidden" in err or "blocked" in err or "deactivated" in err:
+                        users_data.pop(uid_str, None)
+            logger.info(f"Purchase proof broadcast done: sent={sent}, failed={failed}")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    @staticmethod
+    def _html_escape(s):
+        return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def _safe_delete(self, chat_id, message_id):
+        try:
+            self.bot.delete_message(chat_id, message_id)
+        except Exception:
+            pass
+
     def reject_payment(self, user_id, admin_id):
         """Reject payment and notify user"""
         user_id = str(user_id)
