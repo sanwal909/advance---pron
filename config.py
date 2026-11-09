@@ -821,6 +821,55 @@ def get_plans():
 
 PLANS = get_plans()
 
+# ============ AUTO-CLONE CONFIG FROM ANOTHER DB (first-run setup) ============
+# If CLONE_FROM_DB is set in env AND this bot's own DB has no settings yet,
+# automatically copy config (settings + start message + media) from that source DB.
+# This makes multi-bot setup trivial: set DB_NAME for bot 2 + CLONE_FROM_DB=PremiumBot,
+# and on first start it copies everything from bot 1 — users/sales/pending stay isolated.
+CLONE_FROM_DB = os.getenv("CLONE_FROM_DB", "").strip('"').strip("'").strip()
+
+def _auto_clone_on_first_run():
+    if not CLONE_FROM_DB or db is None or client is None:
+        return False
+    # Only clone if THIS bot's DB has no settings document (fresh DB)
+    try:
+        has_settings = False
+        col = db["settings"]
+        if col is not None and col.count_documents({"_id": "main_data"}, limit=1) > 0:
+            has_settings = True
+    except Exception:
+        has_settings = False
+    if has_settings:
+        return False
+
+    print(f"🔄 Fresh DB detected. Auto-cloning config from '{CLONE_FROM_DB}' into '{DB_NAME}'...")
+    logging.info(f"Auto-clone: source='{CLONE_FROM_DB}' target='{DB_NAME}'")
+    try:
+        ok, summary, detail = clone_config_from(CLONE_FROM_DB, include_media=True)
+    except Exception as e:
+        logging.error(f"Auto-clone failed: {type(e).__name__}: {e}")
+        return False
+
+    if ok:
+        print(f"✅ Auto-clone done: {detail}")
+        # Reload live in-place so the running process uses cloned settings
+        try:
+            fresh = load_json_file(SETTINGS_FILE, {})
+            _deep_merge_settings(fresh, DEFAULT_SETTINGS)
+            _run_idempotent_migrations(fresh)
+            settings.clear()
+            settings.update(fresh)
+            global PLANS
+            PLANS = get_plans()
+        except Exception as e:
+            logging.warning(f"Auto-clone in-memory refresh failed: {type(e).__name__}")
+        return True
+    else:
+        print(f"⚠️ Auto-clone not applied: {detail}")
+        return False
+
+_auto_clone_on_first_run()
+
 # Individual save functions
 def save_users_data():
     """Save users data"""
