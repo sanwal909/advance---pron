@@ -261,6 +261,44 @@ _pending_cleanup_thread = threading.Thread(target=auto_clean_pending_payments, d
 _pending_cleanup_thread.start()
 logging.info("🧹 Auto-clean pending payments thread started (10min timeout, no user msg).")
 
+# ============ AUTO-DELETE QUEUE (for broadcast proof messages etc.) ============
+# Queue of (expire_epoch, chat_id, message_id). Single background thread drains it.
+_auto_delete_queue = []
+_auto_delete_lock = threading.Lock()
+
+def schedule_auto_delete(chat_id, message_id, delay_sec=43200):
+    """Schedule a message for deletion after delay_sec (default 12h). Non-blocking."""
+    expire_at = time.time() + max(1, int(delay_sec))
+    with _auto_delete_lock:
+        _auto_delete_queue.append((expire_at, chat_id, message_id))
+
+def _auto_delete_cleanup_loop():
+    while True:
+        try:
+            now = time.time()
+            ready = []
+            with _auto_delete_lock:
+                remaining = []
+                for item in _auto_delete_queue:
+                    if item[0] <= now:
+                        ready.append(item)
+                    else:
+                        remaining.append(item)
+                _auto_delete_queue.clear()
+                _auto_delete_queue.extend(remaining)
+            for _expire, chat_id, message_id in ready:
+                try:
+                    bot.delete_message(chat_id, message_id)
+                except Exception as e:
+                    logging.debug(f"auto-delete skip ({chat_id},{message_id}): {type(e).__name__}")
+        except Exception as e:
+            logging.error(f"auto-delete cleanup error: {type(e).__name__}: {e}")
+        time.sleep(60)
+
+_auto_delete_thread = threading.Thread(target=_auto_delete_cleanup_loop, daemon=True)
+_auto_delete_thread.start()
+logging.info("🧹 Auto-delete queue thread started.")
+
 # Notify Admin about MongoDB status on startup (SAFE: never include Mongo URI in messages)
 def notify_mongo_status():
     try:
@@ -3932,6 +3970,44 @@ def handle_clear_demo_desc(message):
             
     save_settings()
 
+@bot.message_handler(commands=['remove_all_demo', 'remove_all_demos'])
+def handle_remove_all_demo(message):
+    """Remove ALL demos at once: start demos + every plan's demos + descriptions + media cache."""
+    if not is_admin(message.from_user.id):
+        return
+
+    removed_plans = 0
+    removed_items = 0
+
+    # 1. Start demos
+    for _it in list(settings.get('start_demo_videos', [])):
+        if isinstance(_it, dict) and _it.get('media_id'):
+            _media_cache_delete_safe(_it.get('media_id'))
+        removed_items += 1
+    settings['start_demo_videos'] = []
+    settings['start_demo_desc'] = ""
+
+    # 2. All plan demos + descriptions
+    plan_demos = settings.get('plan_demo_videos', {})
+    for plan_id, items in list(plan_demos.items()):
+        for _it in list(items or []):
+            if isinstance(_it, dict) and _it.get('media_id'):
+                _media_cache_delete_safe(_it.get('media_id'))
+            removed_items += 1
+        removed_plans += 1
+    settings['plan_demo_videos'] = {}
+    settings['plan_demo_descs'] = {}
+
+    save_settings()
+    bot.reply_to(
+        message,
+        f"🗑️ <b>All demos removed!</b>\n\n"
+        f"• Plans cleared: <b>{removed_plans}</b>\n"
+        f"• Media/text items removed: <b>{removed_items}</b>\n"
+        f"• Start demos + descriptions also cleared.",
+        parse_mode="HTML"
+    )
+
 @bot.message_handler(commands=['add_premium_ch'])
 def handle_add_premium_ch(message):
     if not is_admin(message.from_user.id):
@@ -5236,6 +5312,7 @@ All other buttons (Buy Now, Back, Payment Done, etc.) automatically get random c
 <b>Album Captions (Descriptions):</b>
 /set_demo_desc [id] [text]  - Set album caption (start_demo or plan_id)
 /clear_demo_desc [id]       - Clear album caption
+/remove_all_demo            - 🗑 Clear ALL demos (start + all plans) + media cache
 
 ━━━━━━━━━━━━━━━
 <b>🔹 CUSTOM START MESSAGE:</b>
