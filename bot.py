@@ -1118,10 +1118,26 @@ def pay2_proxy_ask_url(message):
 
 
 def notify_pay2_error(context, error):
-    """Auto-pay fail hone par admins ko chhota alert bhejo (secrets ke bina)."""
+    """Auto-pay fail hone par admins ko chhota alert bhejo (secrets ke bina).
+
+    Asli reason (message + gateway response snippet) bhi bhejta hai, warna sirf
+    exception class ka naam dikhta tha aur root cause pata nahi chalta tha."""
     try:
-        msg = (f"⚠️ <b>AUTO-PAY ERROR</b>\n\nContext: {context}\n"
-               f"Reason: <code>{type(error).__name__}</code>")
+        detail = str(error).strip() or "-"
+        resp = getattr(error, "response", None)
+        if isinstance(resp, dict):
+            resp_txt = json.dumps(resp, ensure_ascii=False)
+        elif resp:
+            resp_txt = str(resp)
+        else:
+            resp_txt = ""
+
+        msg = (f"⚠️ <b>AUTO-PAY ERROR</b>\n\nContext: {_html_escape(context)}\n"
+               f"Reason: <code>{_html_escape(type(error).__name__)}</code>\n"
+               f"Detail: <code>{_html_escape(detail[:400])}</code>")
+        if resp_txt:
+            msg += f"\nResponse: <code>{_html_escape(resp_txt[:300])}</code>"
+
         for aid in settings.get('admin_ids', []):
             try:
                 bot.send_message(aid, msg, parse_mode="HTML")
