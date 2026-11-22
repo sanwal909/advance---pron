@@ -91,6 +91,7 @@ ORDER_COOLDOWN = 90  # failure ke baad account itne second parked rehta hai
 # Override: PAY2_PROXY env var (poora proxy URL). Disable: PAY2_PROXY=off
 DEFAULT_PROXY = (
     ""
+    ""
 )
 _ENV_PROXY = os.getenv("PAY2_PROXY", DEFAULT_PROXY).strip().strip('"').strip("'")
 # Bot panel se runtime override. None = env/default use karo.
@@ -167,6 +168,26 @@ class DepositError(Exception):
         self.response = response
 
 
+# Gateway edge (CloudFront) non-India IP / dead proxy par "403 forbidden" deta
+# hai. Isliye HTTP error ko readable DepositError me convert karte hain, warna
+# sirf "403 Client Error" dikhta hai aur root cause pata nahi chalta.
+_BLOCKED_CODES = (401, 403, 407, 429)
+
+
+def _raise_for_status(resp) -> None:
+    code = resp.status_code
+    if code < 400:
+        return
+    body = (resp.text or "").strip()[:200]
+    if code in _BLOCKED_CODES:
+        raise DepositError(
+            f"gateway ne request block kar di (HTTP {code}) — proxy off/dead ya "
+            f"non-India IP hai. /pay2_proxy se India residential proxy set karein.",
+            {"status": code, "body": body},
+        )
+    resp.raise_for_status()
+
+
 def parse_body(resp, cipher) -> dict:
     """HTTP body ko dict me badlo.
 
@@ -175,7 +196,7 @@ def parse_body(resp, cipher) -> dict:
       * raw base64 cipher -> AES-128-CBC ciphertext   (jaise payListV4 / orderInfo)
     Purane clients ke liye `{"encryptString": "..."}` wrapped form bhi handle hota hai.
     """
-    resp.raise_for_status()
+    _raise_for_status(resp)
     text = (resp.text or "").strip()
     if not text:
         return {}
@@ -576,7 +597,7 @@ def cqpay_headers(pay_token_value: str = "") -> dict:
 
 def _parse_cqpay(resp: requests.Response) -> dict:
     """pay.cqpay.me reply ko dict me badlo (plain JSON expected; warna raw)."""
-    resp.raise_for_status()
+    _raise_for_status(resp)
     text = (resp.text or "").strip()
     if not text:
         return {}
@@ -994,22 +1015,29 @@ class AccountManager:
     # ------------------------------------------------------------------- public
 
     def get_payment_url(self, amount, kind_type: int = 1, channel_index: int = 0,
-                        sub_index: int | None = None) -> dict:
+                        sub_index: int | None = None,
+                        attempts_per_account: int = 2) -> dict:
         """Kisi bhi free account se deposit order banao aur payment URL return karo.
-        Sab accounts fail hone par DepositError raise hota hai."""
+
+        Har account par `attempts_per_account` baar try hota hai (transient
+        403/timeout ke liye — rotating proxy par aksar ek retry me chal jaata
+        hai). Sab accounts fail hone par DepositError raise hota hai."""
         amount = normalize_amount(amount)
 
-        limit = self.max_attempts or len(self._states)
-        tried: set = set()
+        attempts_per_account = max(1, int(attempts_per_account or 1))
+        limit = self.max_attempts or max(1, len(self._states) * attempts_per_account)
+        tried: dict = {}
         errors: list[str] = []
 
-        while len(tried) < limit:
+        while sum(tried.values()) < limit:
             with self._lock:
-                st = self._pick_locked(tried)
+                exhausted = {s for s, n in tried.items()
+                             if n >= attempts_per_account}
+                st = self._pick_locked(exhausted)
                 if st is None:
                     break
                 st.busy = True
-            tried.add(st)
+            tried[st] = tried.get(st, 0) + 1
 
             try:
                 result = create_deposit(self._session_for(st), amount,
