@@ -17,16 +17,6 @@ import config
 from config import *
 from verif import init_verification, make_colored_button, resolve_color, color_name_display, get_random_button_color_nondefault
 
-# Second payment option: In666/CQPAY "auto-pay" (pay2.py). Optional — bot manual
-# UPI/QR mode me bina iske bhi chalta rahega.
-try:
-    import pay2
-    PAY2_AVAILABLE = True
-except Exception as _pay2_err:
-    pay2 = None
-    PAY2_AVAILABLE = False
-    print(f"ℹ️ pay2 module not loaded ({type(_pay2_err).__name__}) — Auto-Pay disabled.")
-
 # Initialize bot — SAFE TOKEN VALIDATION & VERIFICATION
 # Priority: env var via config.BOT_TOKEN (loaded from .env)
 _token = getattr(config, 'BOT_TOKEN', os.getenv("BOT_TOKEN", ""))
@@ -147,6 +137,33 @@ def _patched_ikb_to_dict(self):
 types.InlineKeyboardButton.to_dict = _patched_ikb_to_dict
 
 
+# ========== PROTECT CONTENT (Save/Forward Restriction) ==========
+# Force protect_content=True on ALL send_* calls so users cannot forward,
+# copy, or save bot messages/media. Admin can override per-call by passing
+# protect_content=False explicitly.
+_PROTECTED_METHODS = (
+    'send_message', 'send_photo', 'send_video', 'send_document',
+    'send_animation', 'send_audio', 'send_voice', 'send_video_note',
+    'send_sticker', 'send_location', 'send_venue', 'send_contact',
+    'send_poll', 'send_dice', 'send_invoice',
+)
+
+def _wrap_protect(method):
+    def _wrapped(*args, **kwargs):
+        if 'protect_content' not in kwargs:
+            kwargs['protect_content'] = True
+        return method(*args, **kwargs)
+    _wrapped.__name__ = getattr(method, '__name__', 'wrapped')
+    return _wrapped
+
+for _mname in _PROTECTED_METHODS:
+    _orig = getattr(bot, _mname, None)
+    if _orig is not None and not getattr(_orig, '_protect_wrapped', False):
+        _wrapped = _wrap_protect(_orig)
+        _wrapped._protect_wrapped = True
+        setattr(bot, _mname, _wrapped)
+
+
 # Initialize verification system
 verif = init_verification(bot)
 
@@ -167,6 +184,105 @@ def make_button(text, **kwargs):
 def _html_escape(s):
     """Escape user-entered text so Telegram HTML parse fail na ho (& < >)."""
     return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+class _SynthAdminMessage:
+    """Minimal stand-in for a telebot Message so existing admin command handlers
+    (which read .chat/.from_user/.text/.reply_to_message and call bot.reply_to)
+    can be invoked directly from an admin button tap — no text command needed."""
+    def __init__(self, chat_id, user_id, text="", message_id=None, reply_to_message=None):
+        self.chat = types.Chat(chat_id, "private")
+        self.from_user = types.User(user_id, False, "Admin")
+        self.text = text
+        self.message_id = message_id
+        self.reply_to_message = reply_to_message
+        # Attributes some handlers probe
+        self.caption = None
+        self.photo = None
+        self.video = None
+        self.document = None
+        self.content_type = "text"
+
+def _run_admin_cmd(command, chat_id, user_id, arg="", message_id=None, reply_to_message=None):
+    """Execute an existing admin command handler from a button tap.
+    `command` is the bare command name (no slash)."""
+    handler = _ADMIN_CMD_HANDLERS.get(command)
+    if not handler:
+        try:
+            bot.send_message(chat_id, "⚠️ This action is unavailable right now.")
+        except Exception:
+            pass
+        return False
+    text = f"/{command}"
+    if arg:
+        text = f"{text} {arg}"
+    synth = _SynthAdminMessage(chat_id, user_id, text=text,
+                               message_id=message_id, reply_to_message=reply_to_message)
+    handler(synth)
+    return True
+
+def _ask_then_run(chat_id, user_id, prompt, command, reply_required=False):
+    """Prompt the admin for input, then dispatch to an existing command handler.
+    reply_required=True → the admin's next message (media/text) is used as the replied message."""
+    msg = bot.send_message(chat_id, prompt, parse_mode="HTML")
+    def _step(m):
+        if not is_admin(m.from_user.id):
+            return
+        try:
+            if reply_required:
+                _run_admin_cmd(command, m.chat.id, m.from_user.id,
+                               message_id=m.message_id, reply_to_message=m)
+            else:
+                val = (m.text or "").strip()
+                if not val or val.lower() in ("/cancel", "cancel"):
+                    bot.reply_to(m, "❌ Cancelled.")
+                    return
+                _run_admin_cmd(command, m.chat.id, m.from_user.id,
+                               arg=val, message_id=m.message_id)
+        except Exception as e:
+            logging.error(f"_ask_then_run({command}) error: {type(e).__name__}: {e}")
+    bot.register_next_step_handler(msg, _step)
+
+def _ask_two_steps(chat_id, user_id, prompt1, prompt2, command):
+    """Ask for a target, then a value, then dispatch `command <target> <value>`."""
+    msg = bot.send_message(chat_id, prompt1, parse_mode="HTML")
+    def _step1(m1):
+        if not is_admin(m1.from_user.id):
+            return
+        target = (m1.text or "").strip()
+        if not target:
+            bot.reply_to(m1, "❌ Cancelled.")
+            return
+        msg2 = bot.send_message(m1.chat.id, prompt2, parse_mode="HTML")
+        def _step2(m2):
+            if not is_admin(m2.from_user.id):
+                return
+            val = (m2.text or "").strip()
+            if not val:
+                bot.reply_to(m2, "❌ Cancelled.")
+                return
+            _run_admin_cmd(command, m2.chat.id, m2.from_user.id,
+                           arg=f"{target} {val}", message_id=m2.message_id)
+        bot.register_next_step_handler(msg2, _step2)
+    bot.register_next_step_handler(msg, _step1)
+
+def _ask_id_then_media(chat_id, user_id, prompt_id, command):
+    """Ask for a plan/target id, then the media (or text), then dispatch the command."""
+    msg = bot.send_message(chat_id, prompt_id, parse_mode="HTML")
+    def _step1(m1):
+        if not is_admin(m1.from_user.id):
+            return
+        target = (m1.text or "").strip()
+        if not target:
+            bot.reply_to(m1, "❌ Cancelled.")
+            return
+        msg2 = bot.send_message(m1.chat.id, "📥 Ab <b>video / photo / text</b> send karo jo add karna hai:", parse_mode="HTML")
+        def _step2(m2):
+            if not is_admin(m2.from_user.id):
+                return
+            _run_admin_cmd(command, m2.chat.id, m2.from_user.id,
+                           arg=target, message_id=m2.message_id, reply_to_message=m2)
+        bot.register_next_step_handler(msg2, _step2)
+    bot.register_next_step_handler(msg, _step1)
 
 def is_admin(user_id):
     """Check if a user is an admin"""
@@ -746,9 +862,7 @@ def initialize_spam_data():
                 "requests": [],
                 "warnings": 0,
                 "blocked_until": 0,
-                "block_level": 0,
-                "ban_reason": "",
-                "banned_by": 0
+                "block_level": 0
             }
             initialized += 1
     if initialized > 0:
@@ -766,9 +880,7 @@ def update_user_activity(user_id):
             "requests": [],
             "warnings": 0,
             "blocked_until": 0,
-            "block_level": 0,
-            "ban_reason": "",
-            "banned_by": 0
+            "block_level": 0
         }
     
     if "requests" not in spam_data[user_id_str]:
@@ -803,9 +915,6 @@ def check_user_blocked(user_id):
         minutes = minutes % 60
         
         warning_msg = f"⛔ <b>YOU ARE BLOCKED!</b>\n\n"
-        
-        if user_data.get("ban_reason"):
-            warning_msg += f"<b>Reason:</b> {user_data['ban_reason']}\n"
         
         if hours > 0:
             warning_msg += f"⏳ Please wait <b>{hours} hours {minutes} minutes</b>\n\n"
@@ -883,45 +992,6 @@ def reset_spam_counter(user_id):
             spam_data[user_id_str]["requests"] = []
             spam_data[user_id_str]["warnings"] = 0
 
-def ban_user(user_id, duration_seconds, reason="", banned_by=None):
-    if banned_by is None:
-        banned_by = settings.get('admin_ids', [None])[0]
-    user_id_str = str(user_id)
-    current_time = time.time()
-    
-    if user_id_str not in spam_data:
-        spam_data[user_id_str] = {
-            "requests": [],
-            "warnings": 0,
-            "blocked_until": 0,
-            "block_level": 0,
-            "ban_reason": reason,
-            "banned_by": banned_by
-        }
-    
-    spam_data[user_id_str]["blocked_until"] = current_time + duration_seconds
-    spam_data[user_id_str]["ban_reason"] = reason
-    spam_data[user_id_str]["banned_by"] = banned_by
-    spam_data[user_id_str]["block_level"] = 3
-    
-    try:
-        if duration_seconds >= 3600:
-            time_display = f"{int(duration_seconds/3600)} hours"
-        elif duration_seconds >= 60:
-            time_display = f"{int(duration_seconds/60)} minutes"
-        else:
-            time_display = f"{duration_seconds} seconds"
-        
-        bot.send_message(
-            int(user_id),
-            f"⛔ <b>BANNED</b>\n\nDuration: {time_display}\nReason: {reason}",
-            parse_mode="HTML"
-        )
-    except:
-        pass
-    
-    return True
-
 # ============ PREMIUM BOT CLASS ============
 class PremiumBot:
     def __init__(self):
@@ -962,122 +1032,7 @@ class PremiumBot:
 
 premium_bot = PremiumBot()
 
-# ========== PAY2 (AUTO-PAY) HELPERS ==========
-def pay2_enabled():
-    """Auto-pay tabhi chale jab module loaded ho, mode ON ho aur account ho."""
-    return (PAY2_AVAILABLE
-            and settings.get('payment_gateway') == 'pay2'
-            and bool(settings.get('pay2_accounts')))
-
-
-def sync_pay2_accounts():
-    """settings ke pay2 accounts ko pay2 module me daalo (startup + har change par).
-    Active account count return karta hai."""
-    if not PAY2_AVAILABLE:
-        return 0
-    try:
-        return pay2.configure_accounts(settings.get('pay2_accounts', []) or [])
-    except Exception as e:
-        logging.error(f"pay2 configure_accounts failed: {type(e).__name__}")
-        return 0
-
-
-def _mask_secret(value, keep=4):
-    """Password jaisa secret log/message me dikhane se pehle mask karo."""
-    s = str(value or "")
-    if len(s) <= keep:
-        return "•" * len(s)
-    return "•" * (len(s) - keep) + s[-keep:]
-
-
-def _mask_proxy(url):
-    """Proxy URL ke credentials mask karo (password kabhi pura na dikhe)."""
-    s = str(url or "")
-    if "://" not in s:
-        return _mask_secret(s) if s else s
-    scheme, rest = s.split("://", 1)
-    if "@" in rest:
-        cred, host = rest.split("@", 1)
-        if ":" in cred:
-            user, pw = cred.split(":", 1)
-            cred = f"{user}:{_mask_secret(pw)}"
-        else:
-            cred = _mask_secret(cred)
-        return f"{scheme}://{cred}@{host}"
-    return s
-
-
-def sync_pay2_proxy():
-    """settings ka proxy override pay2 module me lagao. Effective URL return karta hai.
-
-    "" -> env/default; "off" -> disable; warna pura proxy URL.
-    """
-    if not PAY2_AVAILABLE:
-        return ""
-    val = str(settings.get('pay2_proxy', '') or "").strip()
-    try:
-        return pay2.set_proxy(val if val else None)
-    except Exception as e:
-        logging.error(f"pay2 set_proxy failed: {type(e).__name__}")
-        return ""
-
-
-def pay2_proxy_label():
-    """Panel me dikhane ke liye proxy ki short status line."""
-    if not PAY2_AVAILABLE:
-        return "❌ module load nahi hua"
-    val = str(settings.get('pay2_proxy', '') or "").strip().lower()
-    if val in ("off", "none", "no", "false", "0"):
-        return "🚫 Disabled"
-    try:
-        eff, source = pay2.proxy_status()
-    except Exception:
-        eff, source = "", "off"
-    if not eff:
-        return "🚫 Disabled"
-    tag = {"bot": "custom", "env": "env", "default": "default"}.get(source, source)
-    return f"✅ {_mask_proxy(eff)}  <i>({tag})</i>"
-
-
-def _normalize_proxy(raw):
-    """Admin ke input ko proxy URL me normalize karo. "" / "off" bhi handle."""
-    s = str(raw or "").strip()
-    if not s:
-        return ""
-    low = s.lower()
-    if low in ("off", "none", "disable", "disabled", "no"):
-        return "off"
-    if "://" in s:
-        return s
-    if "@" in s:
-        return "http://" + s
-    parts = s.split(":")
-    if len(parts) == 4:  # host:port:user:pass
-        host, port, user, pw = parts
-        return f"http://{user}:{pw}@{host}:{port}"
-    if len(parts) == 2:  # host:port
-        return "http://" + s
-    return s
-
-
-def pay2_proxy_menu_text():
-    return (f"<b>🌐 AUTO-PAY PROXY</b>\n\n"
-            f"<b>Current:</b> {pay2_proxy_label()}\n\n"
-            f"Gateway (In666/CQPAY) ke saare calls isi proxy se jaate hain. "
-            f"India residential proxy recommended hai.\n\n"
-            f"• <b>Set/Change</b> — apna proxy URL dein (custom)\n"
-            f"• <b>Reset</b> — default/env par wapas\n"
-            f"• <b>Disable</b> — bina proxy direct connection")
-
-
-def pay2_proxy_keyboard():
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("✏️ Set / Change Proxy", callback_data="pay_proxy_set", color="primary"))
-    kb.add(types.InlineKeyboardButton("♻️ Reset to Default", callback_data="pay_proxy_reset", color="primary"))
-    kb.add(types.InlineKeyboardButton("🚫 Disable Proxy", callback_data="pay_proxy_disable", color="negative"))
-    kb.add(types.InlineKeyboardButton("⬅️ Back", callback_data="admin_pay"))
-    return kb
-
+# pay2 (Auto-Pay) module fully removed — only manual UPI/QR payment flow remains.
 
 def _safe_edit_text(chat_id, message_id, text, reply_markup=None):
     """edit_message_text safely — 'message is not modified' (same content) par crash na ho."""
@@ -1087,254 +1042,6 @@ def _safe_edit_text(chat_id, message_id, text, reply_markup=None):
     except Exception:
         pass
 
-
-def pay2_proxy_ask_url(message):
-    """Admin se proxy URL lo, normalize karke save + sync karo (creds message delete)."""
-    if not is_admin(message.from_user.id):
-        return
-    chat_id = message.chat.id
-    raw = (message.text or "").strip()
-    # Security: proxy credentials wala message turant delete karo
-    try:
-        bot.delete_message(chat_id, message.message_id)
-    except Exception:
-        pass
-
-    val = _normalize_proxy(raw)
-    if not val:
-        m = bot.send_message(chat_id, "❌ Proxy URL nahi mila. Panel se dobara try karein.", parse_mode="HTML")
-        track_msg(chat_id, m.message_id)
-        return
-
-    settings['pay2_proxy'] = val
-    save_settings()
-    effective = sync_pay2_proxy()
-
-    note = ("🚫 Proxy disable kar diya." if val == "off"
-            else f"✅ Proxy set ho gaya:\n<code>{_mask_proxy(effective)}</code>")
-    m = bot.send_message(chat_id, f"{note}\n\n{pay2_proxy_menu_text()}",
-                         reply_markup=pay2_proxy_keyboard(), parse_mode="HTML")
-    track_msg(chat_id, m.message_id)
-
-
-def notify_pay2_error(context, error):
-    """Auto-pay fail hone par admins ko chhota alert bhejo (secrets ke bina).
-
-    Asli reason (message + gateway response snippet) bhi bhejta hai, warna sirf
-    exception class ka naam dikhta tha aur root cause pata nahi chalta tha."""
-    try:
-        detail = str(error).strip() or "-"
-        resp = getattr(error, "response", None)
-        if isinstance(resp, dict):
-            resp_txt = json.dumps(resp, ensure_ascii=False)
-        elif resp:
-            resp_txt = str(resp)
-        else:
-            resp_txt = ""
-
-        msg = (f"⚠️ <b>AUTO-PAY ERROR</b>\n\nContext: {_html_escape(context)}\n"
-               f"Reason: <code>{_html_escape(type(error).__name__)}</code>\n"
-               f"Detail: <code>{_html_escape(detail[:400])}</code>")
-        if resp_txt:
-            msg += f"\nResponse: <code>{_html_escape(resp_txt[:300])}</code>"
-
-        for aid in settings.get('admin_ids', []):
-            try:
-                bot.send_message(aid, msg, parse_mode="HTML")
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-
-def pay2_utr_prompt(pv):
-    """UTR maangne wala prompt text (order details ke saath)."""
-    order_num = (pv or {}).get('order_number', 'N/A')
-    amount = (pv or {}).get('amount', '')
-    return (
-        f"⏳ <b>PAYMENT ABHI RECEIVE NAHI HUI (Order #{order_num})</b>\n\n"
-        f"Agar aapne <b>₹{amount}</b> pay kar diya hai to apna "
-        f"<b>UTR / Reference Number</b> (12-digit) yaha bhejein — "
-        f"main third-party site par verify kar dunga.\n\n"
-        f"📸 <i>Ya payment ka screenshot PHOTO ke roop me bhejein (manual verification).</i>"
-    )
-
-
-def pay2_verify_success(chat_id, user_id, source):
-    """Auto-verify hui order ko wahi path se complete karo jo admin verify use karta hai
-    (join link + sale record + premium flag)."""
-    try:
-        ok, _ = verif.verify_payment(str(user_id), "AUTO-PAY")
-    except Exception as e:
-        logging.error(f"pay2 auto-verify failed: {type(e).__name__}")
-        ok = False
-    if ok:
-        try:
-            m = bot.send_message(
-                chat_id,
-                f"🎉 <b>PAYMENT AUTO-VERIFIED!</b>\n\n{source}\n"
-                f"Aapka order confirm ho gaya — join link upar bhej diya gaya hai.",
-                parse_mode="HTML"
-            )
-            track_msg(chat_id, m.message_id)
-        except Exception:
-            pass
-    return ok
-
-
-def pay2_auto_verify(chat_id, user_id):
-    """Payment Done par: pehle get_info se status check -> paid ho to verify,
-    warna user se UTR maango. Background thread se chalta hai."""
-    pv = pending_verifications.get(str(user_id))
-    if not pv:
-        return
-
-    token = pv.get('pay2_token')
-    plan_type = pv.get('plan')
-
-    # pay2 token nahi (manual flow) -> purana screenshot flow
-    if not token:
-        screenshot_msg = verif.ask_for_screenshot(chat_id, user_id, plan_type)
-        if screenshot_msg:
-            track_msg(chat_id, screenshot_msg.message_id)
-        return
-
-    note = None
-    try:
-        note = bot.send_message(chat_id, "🔎 <b>Payment check kar raha hoon...</b>", parse_mode="HTML")
-        track_msg(chat_id, note.message_id)
-    except Exception:
-        note = None
-
-    paid = False
-    try:
-        paid = pay2.is_paid(pay2.check_payment(token))
-    except Exception as e:
-        logging.error(f"pay2 check_payment error: {type(e).__name__}")
-
-    if paid:
-        if note:
-            try:
-                bot.delete_message(chat_id, note.message_id)
-            except Exception:
-                pass
-            if note.message_id in user_all_messages.get(str(chat_id), []):
-                user_all_messages[str(chat_id)].remove(note.message_id)
-        pay2_verify_success(chat_id, user_id, "Gateway ne payment confirm kar di.")
-        return
-
-    # Payment abhi confirm nahi -> UTR maango
-    text = pay2_utr_prompt(pv)
-    prompt_msg = None
-    if note:
-        try:
-            bot.edit_message_text(text, chat_id=chat_id, message_id=note.message_id, parse_mode="HTML")
-            prompt_msg = note
-        except Exception:
-            prompt_msg = None
-    if prompt_msg is None:
-        try:
-            prompt_msg = bot.send_message(chat_id, text, parse_mode="HTML")
-            track_msg(chat_id, prompt_msg.message_id)
-        except Exception:
-            return
-    bot.register_next_step_handler(prompt_msg, pay2_handle_utr)
-
-
-def pay2_handle_utr(message):
-    """User ka UTR lo -> refshjsas se verify -> status re-check -> verify ya screenshot fallback."""
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    pv = pending_verifications.get(str(user_id))
-    if not pv or not pv.get('pay2_token'):
-        return
-
-    # User ne UTR ki jagah screenshot bhej diya -> manual verification
-    if message.photo:
-        verif.handle_screenshot(message)
-        return
-
-    utr = (message.text or "").strip()
-    if not utr or utr.startswith('/'):
-        m = bot.send_message(
-            chat_id,
-            "❌ UTR number sahi se bhejein (jaise <code>100121212121</code>).",
-            parse_mode="HTML"
-        )
-        track_msg(chat_id, m.message_id)
-        bot.register_next_step_handler(m, pay2_handle_utr)
-        return
-
-    token = pv['pay2_token']
-    paid = False
-    try:
-        pay2.submit_utr(token, utr)
-        paid = pay2.is_paid(pay2.check_payment(token))
-    except Exception as e:
-        logging.error(f"pay2 submit_utr error: {type(e).__name__}")
-
-    if paid:
-        pay2_verify_success(chat_id, user_id, f"UTR <code>{utr}</code> verify ho gaya.")
-        return
-
-    # Fallback: manual screenshot verification (admin)
-    m = bot.send_message(
-        chat_id,
-        "⚠️ <b>Auto-verify nahi ho paya.</b>\n\n"
-        "Kripya payment ka <b>screenshot PHOTO</b> ke roop me bhejein — admin manually verify karega.",
-        parse_mode="HTML"
-    )
-    track_msg(chat_id, m.message_id)
-    screenshot_msg = verif.ask_for_screenshot(chat_id, user_id, pv.get('plan'))
-    if screenshot_msg:
-        track_msg(chat_id, screenshot_msg.message_id)
-
-
-def pay2_show_balance(chat_id, msg_id=None):
-    """Admin ke liye har account ka latest balance dikhao (background thread)."""
-    if not PAY2_AVAILABLE:
-        text = "❌ pay2 module load nahi hua (pycryptodome install karein)."
-    else:
-        rows = []
-        try:
-            rows = pay2.get_balances(fresh=True)
-        except Exception as e:
-            logging.error(f"pay2 get_balances error: {type(e).__name__}")
-        if not rows:
-            text = ("<b>💰 AUTO-PAY BALANCES</b>\n\n"
-                    "Koi account configured nahi hai ya fetch fail ho gaya.")
-        else:
-            lines = []
-            for r in rows:
-                phone = r.get('phone', '?')
-                bal = r.get('balance')
-                if bal is None:
-                    bal_txt = f"⚠️ fail ({r.get('error', 'unknown')})"
-                else:
-                    bal_txt = f"₹{bal:,.2f}"
-                lines.append(f"• <code>{phone}</code> — <b>{bal_txt}</b>")
-            text = "<b>💰 AUTO-PAY BALANCES</b>\n\n" + "\n".join(lines)
-
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("🔄 Refresh", callback_data="pay_balance", color="primary"))
-    kb.add(types.InlineKeyboardButton("⬅️ Back", callback_data="admin_pay", color="primary"))
-    try:
-        if msg_id:
-            bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id,
-                                  reply_markup=kb, parse_mode="HTML")
-        else:
-            bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
-    except Exception:
-        pass
-
-
-if PAY2_AVAILABLE:
-    sync_pay2_proxy()
-    _pay2_active = sync_pay2_accounts()
-    if _pay2_active:
-        print(f"✅ pay2 (Auto-Pay): {_pay2_active} account(s) configured.")
-    elif settings.get('payment_gateway') == 'pay2':
-        print("⚠️ Auto-Pay ON hai par koi pay2 account configured nahi — manual UPI/QR use hoga.")
 
 # ========== IMPORTANT LOGS ==========
 def log_important_event(event_type, user_data=None, plan=None):
@@ -1588,7 +1295,7 @@ def handle_plan_selection(call):
 ✅ 24/7 Support Available"""
 
         desc_text = f"""
-<b>💎 {_html_escape(plan.get('name', 'Premium'))} DESCRIPTION:</b>
+<b>{_html_escape(plan.get('name', 'Premium'))}</b>
 
 💰 <b>Amount:</b> ₹{_html_escape(plan.get('amount', ''))}
 ⏳ <b>Duration:</b> {_html_escape(plan.get('duration', 'N/A'))}
@@ -1613,7 +1320,7 @@ def handle_plan_selection(call):
                 m = bot.send_message(chat_id, _html_escape(desc_text), reply_markup=keyboard, parse_mode="HTML")
             except Exception as _se2:
                 logging.error(f"Plan desc escaped fallback failed ({type(_se2).__name__}): {_se2}")
-                plain = (f"💎 {plan.get('name', 'Premium')}\n"
+                plain = (f"{plan.get('name', 'Premium')}\n"
                          f"💰 Amount: ₹{plan.get('amount', '')}\n"
                          f"⏳ Duration: {plan.get('duration', 'N/A')}")
                 m = bot.send_message(chat_id, plain, reply_markup=keyboard)
@@ -1677,23 +1384,19 @@ Jab tak admin purane payment ko verify/reject nahi kar dete, aap naya payment cr
         bot.answer_callback_query(call.id, "❌ Plan not found!", show_alert=True)
         return
 
-    # Auto-Pay mode ON hai to gateway se payment link; warna manual UPI/QR.
-    use_pay2 = pay2_enabled()
-
-    qr_image = None
-    if not use_pay2:
-        # Generate QR FIRST — fail fast (and cleanly) if this plan's amount is invalid,
-        # instead of raising an error later and leaving a broken order.
-        qr_image = premium_bot.generate_qr_code(settings['upi_id'], plan['amount'], settings['upi_name'])
-        if qr_image is None:
-            logging.error(f"Order blocked: invalid amount for plan {plan_type}: {plan['amount']!r}")
-            bot.answer_callback_query(
-                call.id,
-                "⚠️ Payment QR is unavailable for this plan.\n"
-                "Admin: plan ka amount sahi karo (sirf number, jaise 100).",
-                show_alert=True
-            )
-            return
+    # Manual UPI/QR payment flow only (pay2 auto-pay gateway fully removed).
+    # Generate QR FIRST — fail fast (and cleanly) if this plan's amount is invalid,
+    # instead of raising an error later and leaving a broken order.
+    qr_image = premium_bot.generate_qr_code(settings['upi_id'], plan['amount'], settings['upi_name'])
+    if qr_image is None:
+        logging.error(f"Order blocked: invalid amount for plan {plan_type}: {plan['amount']!r}")
+        bot.answer_callback_query(
+            call.id,
+            "⚠️ Payment QR is unavailable for this plan.\n"
+            "Admin: plan ka amount sahi karo (sirf number, jaise 100).",
+            show_alert=True
+        )
+        return
 
     settings['total_orders'] = settings.get('total_orders', 0) + 1
     order_num = settings['total_orders']
@@ -1713,17 +1416,6 @@ Jab tak admin purane payment ko verify/reject nahi kar dete, aap naya payment cr
     except: pass
     if msg_id in user_all_messages.get(str(chat_id), []):
         user_all_messages[str(chat_id)].remove(msg_id)
-
-    if use_pay2:
-        # Link banane me kuch second lag sakte hain — callback turant answer karo
-        # aur kaam background thread me karo (UI block na ho).
-        bot.answer_callback_query(call.id, "⏳ Secure payment link ban raha hai...")
-        threading.Thread(
-            target=send_pay2_payment,
-            args=(chat_id, user_id, plan_type, plan['amount'], plan['name'], order_num),
-            daemon=True
-        ).start()
-        return
 
     caption = f"""
 <b>💰 ORDER #{order_num}: PAY ₹{plan['amount']} FOR {_html_escape(plan['name']).upper()}</b>
@@ -1759,84 +1451,6 @@ Please use any other UPI app (PhonePe, Paytm, BHIM, etc.) for payment.
         delete_message_after_delay(chat_id, sent_msg.message_id, 600, send_timeout_msg=True)
 
     bot.answer_callback_query(call.id)
-
-def send_pay2_payment(chat_id, user_id, plan_type, amount, plan_name, order_num):
-    """Auto-Pay: pay2.py se payment link banao aur user ko button ke saath bhejo.
-    Background thread se chalta hai (network call slow ho sakti hai)."""
-    placeholder = None
-    try:
-        placeholder = bot.send_message(
-            chat_id,
-            "⏳ <b>Secure payment link ban raha hai...</b>\n<i>Please wait thodi der...</i>",
-            parse_mode="HTML"
-        )
-        track_msg(chat_id, placeholder.message_id)
-    except Exception:
-        placeholder = None
-
-    try:
-        res = pay2.get_payment_url(amount)
-        url = res.get("url")
-        if not url:
-            raise RuntimeError("paysubmit ne URL nahi diya")
-    except Exception as e:
-        logging.error(f"pay2 order failed (plan={plan_type}, amount={amount}): {type(e).__name__}")
-        # Failed order → pending entry hata do taaki user dobara try kar sake
-        pending_verifications.pop(str(user_id), None)
-        fail_text = ("❌ <b>Payment link generate nahi ho paya.</b>\n\n"
-                     "Thodi der baad dobara koshish karein. Admin ko alert bhej diya gaya hai.")
-        try:
-            if placeholder:
-                bot.edit_message_text(fail_text, chat_id=chat_id,
-                                      message_id=placeholder.message_id, parse_mode="HTML")
-            else:
-                bot.send_message(chat_id, fail_text, parse_mode="HTML")
-        except Exception:
-            pass
-        notify_pay2_error(f"plan={plan_type}, amount={amount}", e)
-        return
-
-    order_no = res.get("orderNo") or order_num
-    # Auto-verify ke liye gateway token/URL pending order me save karo
-    pv = pending_verifications.get(str(user_id))
-    if pv is not None:
-        pv['pay2_url'] = url
-        pv['pay2_token'] = pay2.pay_token(url)
-        pv['pay2_order_no'] = res.get("orderNo") or ""
-        pending_verifications[str(user_id)] = pv
-
-    text = f"""
-<b>💰 ORDER #{order_num}: PAY ₹{amount} FOR {_html_escape(plan_name).upper()}</b>
-
-✅ <b>Secure payment link ready hai.</b>
-
-<b>Instructions:</b>
-1. Neeche <b>💳 Pay Now</b> button dabao
-2. Payment page par ₹{amount} pay karo
-3. Wapas aake <b>✅ Payment Done</b> dabao
-
-<b>Gateway Order:</b> <code>{order_no}</code>
-
-⏳ <i>Ye link 10 minute me auto-delete ho jayega.</i>
-    """
-
-    keyboard = types.InlineKeyboardMarkup(row_width=1)
-    # URL button par Telegram color support nahi karta
-    keyboard.add(types.InlineKeyboardButton("💳 Pay Now", url=url))
-    keyboard.add(make_button("✅ Payment Done", callback_data="payment_done"))
-    keyboard.add(make_button("🔙 Back", callback_data=f"plan_{plan_type}"))
-
-    if placeholder:
-        try:
-            bot.edit_message_text(text, chat_id=chat_id, message_id=placeholder.message_id,
-                                  reply_markup=keyboard, parse_mode="HTML")
-            delete_message_after_delay(chat_id, placeholder.message_id, 600)
-            return
-        except Exception:
-            pass
-    m = bot.send_message(chat_id, text, reply_markup=keyboard, parse_mode="HTML")
-    track_msg(chat_id, m.message_id)
-    delete_message_after_delay(chat_id, m.message_id, 600)
 
 @bot.callback_query_handler(func=lambda call: call.data == "back_to_main")
 def handle_back_to_main(call):
@@ -1948,11 +1562,6 @@ def handle_payment_done(call):
         user_all_messages[str(chat_id)].remove(msg_id)
 
     pv = pending_verifications[str(user_id)]
-    # pay2 order -> pehle auto-verify (get_info); warna purana manual screenshot flow
-    if PAY2_AVAILABLE and pv.get('pay2_token'):
-        bot.answer_callback_query(call.id, "🔎 Payment check kar raha hoon...")
-        threading.Thread(target=pay2_auto_verify, args=(chat_id, user_id), daemon=True).start()
-        return
 
     screenshot_msg = verif.ask_for_screenshot(chat_id, user_id, pv['plan'])
     if screenshot_msg:
@@ -2244,43 +1853,6 @@ Order successfully cancel ho gaya. Naya order create karne ke liye /start use ka
 
 # ========== /SETTINGS COMMAND (FIXED HTML) ==========
 # ========== ADMIN PANEL (Button Based) ==========
-def pay2_menu_keyboard():
-    on = settings.get('payment_gateway') == 'pay2'
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton(
-        f"💳 Auto-Pay: {'ON ✅' if on else 'OFF ❌'}",
-        callback_data="pay_toggle",
-        color="positive" if on else "negative"
-    ))
-    kb.add(types.InlineKeyboardButton("➕ Add Account", callback_data="pay_add_acc", color="primary"))
-    kb.add(types.InlineKeyboardButton(
-        f"📋 List Accounts ({len(settings.get('pay2_accounts', []))})",
-        callback_data="pay_list_acc", color="primary"
-    ))
-    kb.add(types.InlineKeyboardButton("💰 Balance / Orders", callback_data="pay_balance", color="positive"))
-    kb.add(types.InlineKeyboardButton("🌐 Proxy Settings", callback_data="pay_proxy", color="primary"))
-    kb.add(types.InlineKeyboardButton("🗑 Clear All Accounts", callback_data="pay_clear_acc", color="negative"))
-    kb.add(types.InlineKeyboardButton("⬅️ Back to Menu", callback_data="admin_main"))
-    return kb
-
-
-def pay2_menu_text():
-    accounts = settings.get('pay2_accounts', [])
-    if not PAY2_AVAILABLE:
-        status = "❌ module load nahi hua (pycryptodome install karein)"
-    elif settings.get('payment_gateway') == 'pay2' and not accounts:
-        status = "⚠️ ON hai par koi account nahi — manual UPI/QR fallback chalega"
-    else:
-        status = "ON ✅" if settings.get('payment_gateway') == 'pay2' else "OFF (manual UPI/QR)"
-    return (f"<b>💳 AUTO-PAY (pay2) SETTINGS</b>\n\n"
-            f"<b>Mode:</b> {status}\n"
-            f"<b>Accounts:</b> {len(accounts)}\n"
-            f"<b>Proxy:</b> {pay2_proxy_label()}\n\n"
-            f"ON hone par users ko gateway ka <b>payment link</b> milega "
-            f"(manual UPI/QR OFF). OFF karne par purana UPI/QR flow chalu rahega.\n\n"
-            f"<b>Add Account:</b> phone country code ke saath, jaise "
-            f"<code>+91-9XXXXXXXXX</code>")
-
 
 def admin_menu_keyboard():
     keyboard = types.InlineKeyboardMarkup(row_width=2)
@@ -2296,13 +1868,8 @@ def admin_menu_keyboard():
         types.InlineKeyboardButton("💰 UPI & Payment", callback_data="admin_upi", color="positive"),
         types.InlineKeyboardButton("📊 Stats & Sales", callback_data="admin_stats", color="positive")
     )
-    
-    # Row 3: Auto-Pay gateway (pay2)
-    keyboard.add(
-        types.InlineKeyboardButton("💳 Auto-Pay (pay2)", callback_data="admin_pay", color="primary")
-    )
 
-    # Row 4: Admin & Modes
+    # Row 3: Admin & Modes
     keyboard.add(
         types.InlineKeyboardButton("👑 Admin Mgmt", callback_data="admin_users", color="negative"),
         types.InlineKeyboardButton("🔐 Bot Modes", callback_data="admin_modes", color="negative")
@@ -2313,10 +1880,15 @@ def admin_menu_keyboard():
         types.InlineKeyboardButton("📤 Broadcast", callback_data="admin_broadcast", color="primary"),
         types.InlineKeyboardButton("📥 Clone Config", callback_data="admin_clone", color="primary")
     )
-    
-    # Row 5: Close
+
+    # Row 5: All remaining actions as buttons (no command typing needed)
+    keyboard.add(
+        types.InlineKeyboardButton("⚙️ Setup & Tools", callback_data="admin_more", color="primary")
+    )
+
+    # Row 6: Close
     keyboard.add(types.InlineKeyboardButton("❌ Close Menu", callback_data="admin_close"))
-    
+
     return keyboard
 
 @bot.message_handler(commands=['admin'])
@@ -2332,7 +1904,7 @@ def handle_admin_command(message):
     )
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith((
-    'admin_', 'pay_', 'upi_set_', 'mode_toggle_', 'demo_set_', 'demo_toggle_'
+    'admin_', 'upi_set_', 'mode_toggle_', 'demo_set_', 'demo_toggle_'
 )))
 def handle_admin_callbacks(call):
     user_id = call.from_user.id
@@ -2389,131 +1961,16 @@ def handle_admin_callbacks(call):
         msg = bot.send_message(call.message.chat.id, "Enter New UPI Name:")
         bot.register_next_step_handler(msg, lambda m: update_setting(m, 'upi_name', "UPI Name"))
 
-    elif data == "admin_pay":
-        bot.edit_message_text(
-            pay2_menu_text(),
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=pay2_menu_keyboard(),
-            parse_mode="HTML"
-        )
-
-    elif data == "pay_toggle":
-        if not PAY2_AVAILABLE:
-            bot.answer_callback_query(call.id, "❌ pay2 module load nahi hua (pycryptodome install karein)", show_alert=True)
-            return
-        turning_on = settings.get('payment_gateway') != 'pay2'
-        if turning_on and not settings.get('pay2_accounts'):
-            bot.answer_callback_query(call.id, "⚠️ Pehle kam-se-kam ek account add karein.", show_alert=True)
-            return
-        settings['payment_gateway'] = 'pay2' if turning_on else 'manual'
-        save_settings()
-        sync_pay2_accounts()
-        bot.edit_message_text(
-            pay2_menu_text(),
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=pay2_menu_keyboard(),
-            parse_mode="HTML"
-        )
-
-    elif data == "pay_add_acc":
-        msg = bot.send_message(
-            call.message.chat.id,
-            "<b>➕ Add Auto-Pay Account</b>\n\nEnter Phone (country code ke saath, e.g. <code>+91-9XXXXXXXXX</code>):",
-            parse_mode="HTML"
-        )
-        bot.register_next_step_handler(msg, pay2_ask_password)
-
-    elif data == "pay_list_acc":
-        accounts = settings.get('pay2_accounts', [])
-        if not accounts:
-            bot.answer_callback_query(call.id, "Koi account configured nahi hai.", show_alert=True)
-            return
-        lines = [f"{i}. <code>{a.get('phone','')}</code> — 🔑 <code>{_mask_secret(a.get('password',''))}</code>"
-                 for i, a in enumerate(accounts, 1)]
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("⬅️ Back", callback_data="admin_pay"))
-        bot.edit_message_text(
-            "<b>📋 AUTO-PAY ACCOUNTS</b>\n\n" + "\n".join(lines) + "\n\n<i>Passwords masked hain.</i>",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
-
-    elif data == "pay_balance":
-        try:
-            bot.edit_message_text(
-                "⏳ <b>Balance check ho raha hai...</b>\n<i>Gateway se fresh balance aa raha hai...</i>",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-        threading.Thread(
-            target=pay2_show_balance,
-            args=(call.message.chat.id, call.message.message_id),
-            daemon=True
-        ).start()
-        bot.answer_callback_query(call.id)
-
-    elif data == "pay_proxy":
-        _safe_edit_text(call.message.chat.id, call.message.message_id,
-                        pay2_proxy_menu_text(), pay2_proxy_keyboard())
-        bot.answer_callback_query(call.id)
-
-    elif data == "pay_proxy_set":
-        msg = bot.edit_message_text(
-            "🌐 <b>PROXY SET KARO</b>\n\n"
-            "Poora proxy URL bhejein, jaise:\n"
-            "<code>http://user:pass@host:port</code>\n\n"
-            "• Bare format bhi chalega: <code>host:port:user:pass</code>\n"
-            "• SOCKS5: <code>socks5://user:pass@host:port</code>\n"
-            "• Aapka ye message security ke liye turant delete ho jayega.",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            parse_mode="HTML"
-        )
-        bot.register_next_step_handler(msg, pay2_proxy_ask_url)
-        bot.answer_callback_query(call.id)
-
-    elif data == "pay_proxy_disable":
-        settings['pay2_proxy'] = 'off'
-        save_settings()
-        sync_pay2_proxy()
-        _safe_edit_text(call.message.chat.id, call.message.message_id,
-                        pay2_proxy_menu_text(), pay2_proxy_keyboard())
-        bot.answer_callback_query(call.id, "🚫 Proxy disabled")
-
-    elif data == "pay_proxy_reset":
-        settings['pay2_proxy'] = ''
-        save_settings()
-        sync_pay2_proxy()
-        _safe_edit_text(call.message.chat.id, call.message.message_id,
-                        pay2_proxy_menu_text(), pay2_proxy_keyboard())
-        bot.answer_callback_query(call.id, "♻️ Default par reset")
-
-    elif data == "pay_clear_acc":
-        settings['pay2_accounts'] = []
-        settings['payment_gateway'] = 'manual'
-        save_settings()
-        sync_pay2_accounts()
-        bot.edit_message_text(
-            pay2_menu_text(),
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=pay2_menu_keyboard(),
-            parse_mode="HTML"
-        )
-
     elif data == "admin_stats":
         total_users = len(users_data)
         premium_users = sum(1 for u in users_data.values() if u.get('is_premium'))
         total_sales = sum(float(s.get('amount', 0)) for s in sales_data)
         text = f"<b>📊 BOT STATISTICS</b>\n\n👤 <b>Total Users:</b> {total_users}\n💎 <b>Premium Users:</b> {premium_users}\n💰 <b>Total Revenue:</b> ₹{total_sales:.2f}\n📦 <b>Total Orders:</b> {len(sales_data)}"
-        kb = types.InlineKeyboardMarkup()
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("🧾 Sales Report", callback_data="admin_c_sales", color="positive"),
+            types.InlineKeyboardButton("⏳ Pending List", callback_data="admin_c_pending", color="primary")
+        )
         kb.add(types.InlineKeyboardButton("⬅️ Back", callback_data="admin_main"))
         bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb, parse_mode="HTML")
 
@@ -2524,15 +1981,22 @@ def handle_admin_callbacks(call):
             types.InlineKeyboardButton(f"🧾 Proof Status: {'ON' if settings.get('payment_proof_status') else 'OFF'}", callback_data="mode_toggle_proof"),
             types.InlineKeyboardButton(f"🛡️ Force Join: {'ON' if settings.get('force_join_status') else 'OFF'}", callback_data="mode_toggle_force"),
             types.InlineKeyboardButton(f"🤖 Auto-Accept: {'ON' if settings.get('auto_accept_requests') else 'OFF'}", callback_data="mode_toggle_auto"),
+            types.InlineKeyboardButton(f"🆘 Support Button: {'ON' if settings.get('support_status', True) else 'OFF'}", callback_data="mode_toggle_support"),
+            types.InlineKeyboardButton(f"🧩 Multi-Button Layout: {'ON' if settings.get('multi_button_mode') else 'OFF'}", callback_data="mode_toggle_btnlayout"),
             types.InlineKeyboardButton("⬅️ Back to Menu", callback_data="admin_main")
         )
-        bot.edit_message_text("<b>🔐 BOT MODES</b>\n\nToggle security and automation modes:", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb, parse_mode="HTML")
+        bot.edit_message_text(
+            "<b>🔐 BOT MODES</b>\n\nToggle security and automation modes:\n\n"
+            "<i>🧩 Multi-Button Layout = ON karne par channel/demo buttons 1-2-1 pattern me "
+            "dikhenge. OFF par ek line me ek button.</i>",
+            chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb, parse_mode="HTML")
 
     elif data.startswith("mode_toggle_"):
         mode = data.replace("mode_toggle_", "")
-        key = {"join": "join_request_mode", "proof": "payment_proof_status", "force": "force_join_status", "auto": "auto_accept_requests"}.get(mode)
+        key = {"join": "join_request_mode", "proof": "payment_proof_status", "force": "force_join_status", "auto": "auto_accept_requests", "support": "support_status", "btnlayout": "multi_button_mode"}.get(mode)
         if key:
-            settings[key] = not settings.get(key, False)
+            _mode_defaults = {"support_status": True}
+            settings[key] = not settings.get(key, _mode_defaults.get(key, False))
             save_settings()
             handle_admin_callbacks(types.CallbackQuery(id='0', from_user=call.from_user, chat_instance='0', message=call.message, data='admin_modes', json_string='{}'))
 
@@ -2591,6 +2055,201 @@ def handle_admin_callbacks(call):
         msg = bot.send_message(call.message.chat.id, "Enter New Demo Channel ID:")
         bot.register_next_step_handler(msg, lambda m: update_setting(m, 'demo_channel_id', "Demo ID"))
 
+    # ==================== SETUP & TOOLS (extra commands as buttons) ====================
+    elif data == "admin_more":
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("📝 Start Message", callback_data="admin_m_startmsg", color="primary"),
+            types.InlineKeyboardButton("🎬 Demo Media", callback_data="admin_m_demos", color="primary")
+        )
+        kb.add(
+            types.InlineKeyboardButton("💰 Prices & Channels", callback_data="admin_m_prices", color="positive"),
+            types.InlineKeyboardButton("🎨 Proof & Media", callback_data="admin_m_proof", color="positive")
+        )
+        kb.add(
+            types.InlineKeyboardButton("💾 Data & Backup", callback_data="admin_m_data", color="negative"),
+            types.InlineKeyboardButton("🧹 Reset / Clear", callback_data="admin_m_reset", color="negative")
+        )
+        kb.add(
+            types.InlineKeyboardButton("📖 All Settings", callback_data="admin_c_settings", color="positive"),
+            types.InlineKeyboardButton("❓ Admin Help", callback_data="admin_c_help", color="primary")
+        )
+        kb.add(types.InlineKeyboardButton("⬅️ Back to Menu", callback_data="admin_main"))
+        bot.edit_message_text(
+            "<b>⚙️ SETUP & TOOLS</b>\n\n"
+            "Saare baaki kaam yahin se buttons se karein — command type karne ki zaroorat nahi:",
+            chat_id=call.message.chat.id, message_id=call.message.message_id,
+            reply_markup=kb, parse_mode="HTML")
+
+    # -------- Start message --------
+    elif data == "admin_m_startmsg":
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("📝 Set Start Message", callback_data="admin_c_setstartmsg", color="positive"),
+            types.InlineKeyboardButton("👁 View Start Message", callback_data="admin_c_getstartmsg", color="primary"),
+            types.InlineKeyboardButton("🗑 Clear Start Message", callback_data="admin_c_clearstartmsg", color="negative"),
+            types.InlineKeyboardButton("⬅️ Back", callback_data="admin_more")
+        )
+        bot.edit_message_text(
+            "<b>📝 START MESSAGE</b>\n\n<i>Set karne ke liye button dabayein, phir bot jis media/text ko start pe dikhana hai woh bhejein.</i>",
+            chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb, parse_mode="HTML")
+
+    # -------- Demo media (advanced) --------
+    elif data == "admin_m_demos":
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("➕ Add /start Demo", callback_data="admin_c_addstartdemo", color="positive"),
+            types.InlineKeyboardButton("➕ Add Plan Demo", callback_data="admin_c_addplandemo", color="positive"),
+            types.InlineKeyboardButton("📝 Set Demo Description", callback_data="admin_c_setdemodesc", color="primary"),
+            types.InlineKeyboardButton("👁 View / Clear (per plan)", callback_data="admin_channels", color="primary"),
+            types.InlineKeyboardButton("🗑 Clear /start Demos", callback_data="admin_c_clearstartdemo", color="negative"),
+            types.InlineKeyboardButton("🗑 Clear Plan Demos", callback_data="admin_c_clearplandemo", color="negative"),
+            types.InlineKeyboardButton("🗑 Clear Demo Description", callback_data="admin_c_cleardemodesc", color="negative"),
+            types.InlineKeyboardButton("☢️ Remove ALL Demos", callback_data="admin_c_removealldemo", color="negative"),
+            types.InlineKeyboardButton("⬅️ Back", callback_data="admin_more")
+        )
+        bot.edit_message_text(
+            "<b>🎬 DEMO MEDIA</b>\n\n<i>Media bhejne wale buttons: pehle button dabayein, phir media/text bhejein.</i>",
+            chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb, parse_mode="HTML")
+
+    # -------- Prices & Channels (advanced) --------
+    elif data == "admin_m_prices":
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("➕ Add Channel", callback_data="admin_c_addch", color="positive"),
+            types.InlineKeyboardButton("✏️ Edit Channel", callback_data="admin_c_editch", color="primary"),
+            types.InlineKeyboardButton("❌ Remove Channel", callback_data="admin_c_removech", color="negative"),
+            types.InlineKeyboardButton("💵 Set Price (single/all)", callback_data="admin_c_setprice", color="positive"),
+            types.InlineKeyboardButton("🔢 Set Legacy Ch Slot 1-7", callback_data="admin_c_setch", color="primary"),
+            types.InlineKeyboardButton("⬅️ Back", callback_data="admin_more")
+        )
+        bot.edit_message_text(
+            "<b>💰 PRICES & CHANNELS</b>\n\n<i>Advanced channel settings. Normal add/edit ke liye 'Manage Channels' use karein.</i>",
+            chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb, parse_mode="HTML")
+
+    # -------- Proof & Media --------
+    elif data == "admin_m_proof":
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("🔗 Set Proof Link", callback_data="admin_c_setprooflink", color="primary"),
+            types.InlineKeyboardButton("📢 Set Proof Channel", callback_data="admin_c_setproofch", color="primary"),
+            types.InlineKeyboardButton("🎥 Set Backup Channel", callback_data="admin_c_setbackupch", color="primary"),
+            types.InlineKeyboardButton("🗂 Media Cache Now", callback_data="admin_c_mediacache", color="positive"),
+            types.InlineKeyboardButton("🔍 Media Cache Check", callback_data="admin_c_mediacheck", color="positive"),
+            types.InlineKeyboardButton("⬅️ Back", callback_data="admin_more")
+        )
+        bot.edit_message_text(
+            "<b>🎨 PROOF & MEDIA</b>\n\nProof link/channel aur media-cache (token-change safe) tools:",
+            chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb, parse_mode="HTML")
+
+    # -------- Data & Backup --------
+    elif data == "admin_m_data":
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("📦 Backup Now", callback_data="admin_c_backup", color="positive"),
+            types.InlineKeyboardButton("💾 Save Data", callback_data="admin_c_savedata", color="positive"),
+            types.InlineKeyboardButton("🧹 Clean Old Backups", callback_data="admin_c_cleanbackups", color="primary"),
+            types.InlineKeyboardButton("📤 Export Data (JSON)", callback_data="admin_c_exportdata", color="primary"),
+            types.InlineKeyboardButton("📥 Import Data (reply JSON)", callback_data="admin_c_impdata", color="primary"),
+            types.InlineKeyboardButton("☁️ Import to Mongo (reply JSON)", callback_data="admin_c_impmongo", color="primary"),
+            types.InlineKeyboardButton("🚀 Migrate to Mongo", callback_data="admin_c_migrate", color="primary"),
+            types.InlineKeyboardButton("📥 Clone Config", callback_data="admin_c_cloneconfig", color="primary"),
+            types.InlineKeyboardButton("⬅️ Back", callback_data="admin_more")
+        )
+        bot.edit_message_text(
+            "<b>💾 DATA & BACKUP</b>\n\n<i>Import wale buttons: pehle button dabayein, phir JSON file bhejein.</i>",
+            chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb, parse_mode="HTML")
+
+    # -------- Reset / Clear --------
+    elif data == "admin_m_reset":
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("⏳ Pending Verifications", callback_data="admin_c_pending", color="primary"),
+            types.InlineKeyboardButton("🧹 Clear Pending Payments", callback_data="admin_c_clearpending", color="negative"),
+            types.InlineKeyboardButton("🧹 Clear Verified Sales", callback_data="admin_c_clearverified", color="negative"),
+            types.InlineKeyboardButton("☢️ Clear ALL Payments", callback_data="admin_c_clearall", color="negative"),
+            types.InlineKeyboardButton("🔢 Reset Order Counter", callback_data="admin_c_clearorders", color="negative"),
+            types.InlineKeyboardButton("⬅️ Back", callback_data="admin_more")
+        )
+        bot.edit_message_text(
+            "<b>🧹 RESET / CLEAR</b>\n\n<i>Dhyan se! Ye records permanently delete karte hain.</i>",
+            chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb, parse_mode="HTML")
+
+    # -------- Command buttons: direct run --------
+    elif data in ("admin_c_getstartmsg", "admin_c_clearstartmsg", "admin_c_clearstartdemo",
+                  "admin_c_removealldemo", "admin_c_mediacache", "admin_c_mediacheck",
+                  "admin_c_backup", "admin_c_savedata", "admin_c_cleanbackups", "admin_c_exportdata",
+                  "admin_c_migrate", "admin_c_pending", "admin_c_clearpending", "admin_c_clearverified",
+                  "admin_c_clearall", "admin_c_clearorders", "admin_c_sales",
+                  "admin_c_settings", "admin_c_help"):
+        _cmd_map = {
+            "admin_c_getstartmsg": "getstartmsg",
+            "admin_c_clearstartmsg": "clearstartmsg",
+            "admin_c_clearstartdemo": "clear_start_demos",
+            "admin_c_removealldemo": "remove_all_demo",
+            "admin_c_mediacache": "media_cache_now",
+            "admin_c_mediacheck": "media_check",
+            "admin_c_backup": "backup",
+            "admin_c_savedata": "savedata",
+            "admin_c_cleanbackups": "cleanbackups",
+            "admin_c_exportdata": "exportdata",
+            "admin_c_migrate": "migrate_to_mongo",
+            "admin_c_pending": "pending",
+            "admin_c_clearpending": "clear_pending_pay",
+            "admin_c_clearverified": "clear_verified",
+            "admin_c_clearall": "clear_all_payments",
+            "admin_c_clearorders": "clear_orders",
+            "admin_c_sales": "sales",
+            "admin_c_settings": "settings",
+            "admin_c_help": "help",
+        }
+        _run_admin_cmd(_cmd_map[data], call.message.chat.id, call.from_user.id,
+                       message_id=call.message.message_id)
+
+    # -------- Command buttons: prompt for a single value --------
+    elif data in ("admin_c_setstartmsg", "admin_c_addstartdemo", "admin_c_addplandemo",
+                  "admin_c_clearplandemo", "admin_c_cleardemodesc", "admin_c_addch",
+                  "admin_c_editch", "admin_c_removech", "admin_c_setprooflink",
+                  "admin_c_setproofch", "admin_c_setbackupch", "admin_c_impdata",
+                  "admin_c_impmongo", "admin_c_cloneconfig"):
+        _ask_cfg = {
+            "admin_c_setstartmsg": ("📝 <b>Start Message set karein</b>\n\nAb jo <b>media (photo/video) ya text</b> start pe dikhana hai, woh <b>abhi bhejein</b>.", "setstartmsg", True),
+            "admin_c_addstartdemo": ("🎬 <b>Add /start Demo</b>\n\nAb demo <b>media (photo/video) ya text</b> bhejein — /start demos me add ho jayega.", "set_start_demos", True),
+            "admin_c_addplandemo": ("🎬 <b>Add Plan Demo</b>\n\nPehle <b>plan ID</b> bhejein (jaise <code>ch1</code>), phir media/text.", "set_plan_demos", "id_media"),
+            "admin_c_clearplandemo": ("🗑 Kis plan ka demo clear karna hai? <b>plan ID</b> bhejein (jaise <code>ch1</code>):", "clear_plan_demos", False),
+            "admin_c_cleardemodesc": ("🗑 Kis ka description clear karna hai? <code>start</code> ya <b>plan ID</b> bhejein:", "clear_demo_desc", False),
+            "admin_c_addch": ("➕ <b>Add Channel</b>\n\nEk line me bhejein:\n<code>id Name price channel_id</code>\nExample: <code>ch9 VIP Pack 199 -1001234567890</code>", "add_premium_ch", False),
+            "admin_c_editch": ("✏️ <b>Edit Channel</b>\n\nBhejein: <code>id key new_value</code>\nKeys: <code>name / amount / channel_id / duration / description / color</code>", "edit_premium_ch", False),
+            "admin_c_removech": ("❌ Remove karne ke liye channel <b>id</b> bhejein (jaise <code>ch1</code>):", "remove_premium_ch", False),
+            "admin_c_setprooflink": ("🔗 Payment <b>proof link</b> (URL) bhejein:", "set_proof_link", False),
+            "admin_c_setproofch": ("📢 <b>Proof channel ID</b> bhejein (jaise <code>-1001234567890</code>):", "set_proof_channel", False),
+            "admin_c_setbackupch": ("🎥 <b>Backup channel ID</b> bhejein (demo videos auto-store):", "set_backup_ch", False),
+            "admin_c_impdata": ("📥 Ab <b>JSON file</b> bhejein (users import):", "impdata", True),
+            "admin_c_impmongo": ("☁️ Ab <b>JSON file</b> bhejein (MongoDB merge import):", "imp_to_mongo", True),
+            "admin_c_cloneconfig": ("📥 <b>Clone Config</b>\n\nSource DB name bhejein (jisse config clone karna hai):", "clone_config", False),
+        }
+        _prompt, _cmd, _mode = _ask_cfg[data]
+        if _mode == "id_media":
+            _ask_id_then_media(call.message.chat.id, call.from_user.id, _prompt, _cmd)
+        else:
+            _ask_then_run(call.message.chat.id, call.from_user.id, _prompt, _cmd, reply_required=bool(_mode))
+
+    # -------- Command buttons: prompt for two values --------
+    elif data == "admin_c_setdemodesc":
+        _ask_two_steps(call.message.chat.id, call.from_user.id,
+                       "📝 Kis ka demo description? <code>start</code> ya <b>plan ID</b> bhejein:",
+                       "Ab naya <b>description</b> bhejein:", "set_demo_desc")
+
+    elif data == "admin_c_setprice":
+        _ask_two_steps(call.message.chat.id, call.from_user.id,
+                       "💵 Kis type ka price set karna hai? <code>single</code> ya <code>all</code> bhejein:",
+                       "Ab <b>amount</b> bhejein (sirf number):", "set_price")
+
+    elif data == "admin_c_setch":
+        _ask_two_steps(call.message.chat.id, call.from_user.id,
+                       "🔢 Legacy channel slot (1-7) bhejein:",
+                       "Ab <b>channel ID</b> bhejein:", "set_ch")
+
     # Synthetic CallbackQuery (id='0') se recursive calls bhi aate hain — un par
     # answer_callback_query fail ho sakta hai, isliye safely ignore karo.
     try:
@@ -2612,130 +2271,6 @@ def update_setting(message, key, name):
     settings[key] = message.text.strip()
     save_settings()
     bot.send_message(message.chat.id, f"✅ {name} updated to: <code>{settings[key]}</code>", parse_mode="HTML")
-
-# ========== AUTO-PAY (pay2) ACCOUNT ADD FLOW ==========
-def pay2_ask_password(message):
-    """Step 1 (phone) mil gaya → ab password maango."""
-    phone = (message.text or "").strip()
-    if " " in phone or len(phone) < 6 or len(phone) > 20:
-        bot.reply_to(message, "❌ Invalid phone. Format: <code>+91-9XXXXXXXXX</code>\nDubara <b>➕ Add Account</b> se try karein.", parse_mode="HTML")
-        return
-    msg = bot.send_message(
-        message.chat.id,
-        f"<b>Phone:</b> <code>{phone}</code>\n\nEnter Password:",
-        parse_mode="HTML"
-    )
-    bot.register_next_step_handler(msg, pay2_save_account, phone)
-
-
-def pay2_save_account(message, phone):
-    """Step 2 (password) → account save karo aur password wala message delete karo."""
-    password = (message.text or "").strip()
-    # Security: password wala message turant delete kar do
-    try:
-        bot.delete_message(message.chat.id, message.message_id)
-    except Exception:
-        pass
-    if not password:
-        bot.send_message(message.chat.id, "❌ Password khaali tha. Dubara <b>➕ Add Account</b> se try karein.", parse_mode="HTML")
-        return
-
-    accounts = [a for a in settings.get('pay2_accounts', []) if a.get('phone') != phone]
-    accounts.append({"phone": phone, "password": password})
-    settings['pay2_accounts'] = accounts
-    save_settings()
-    active = sync_pay2_accounts()
-
-    bot.send_message(
-        message.chat.id,
-        f"✅ <b>Account added!</b>\n\n"
-        f"<b>Phone:</b> <code>{phone}</code>\n"
-        f"<b>Password:</b> <code>{_mask_secret(password)}</code>\n"
-        f"<b>Active accounts:</b> {active}\n\n"
-        f"Auto-Pay ON karne ke liye <code>/pay2</code> khol kar toggle karein.",
-        parse_mode="HTML"
-    )
-
-
-# ========== /PAY2 COMMANDS (AUTO-PAY GATEWAY) ==========
-@bot.message_handler(commands=['pay2'])
-def handle_pay2_command(message):
-    if not is_admin(message.from_user.id):
-        return
-    bot.reply_to(message, pay2_menu_text(), reply_markup=pay2_menu_keyboard(), parse_mode="HTML")
-
-
-@bot.message_handler(commands=['pay2_toggle'])
-def handle_pay2_toggle(message):
-    if not is_admin(message.from_user.id):
-        return
-    if not PAY2_AVAILABLE:
-        bot.reply_to(message, "❌ pay2 module load nahi hua. <code>pip install pycryptodome</code> karke restart karein.", parse_mode="HTML")
-        return
-    turning_on = settings.get('payment_gateway') != 'pay2'
-    if turning_on and not settings.get('pay2_accounts'):
-        bot.reply_to(message, "⚠️ Pehle kam-se-kam ek account add karein: <code>/pay2_add</code>", parse_mode="HTML")
-        return
-    settings['payment_gateway'] = 'pay2' if turning_on else 'manual'
-    save_settings()
-    sync_pay2_accounts()
-    bot.reply_to(message, f"✅ Auto-Pay ab <b>{'ON' if turning_on else 'OFF'}</b>.", parse_mode="HTML")
-
-
-@bot.message_handler(commands=['pay2_add'])
-def handle_pay2_add(message):
-    if not is_admin(message.from_user.id):
-        return
-    msg = bot.send_message(
-        message.chat.id,
-        "<b>➕ Add Auto-Pay Account</b>\n\nEnter Phone (e.g. <code>+91-9XXXXXXXXX</code>):",
-        parse_mode="HTML"
-    )
-    bot.register_next_step_handler(msg, pay2_ask_password)
-
-
-@bot.message_handler(commands=['pay2_list'])
-def handle_pay2_list(message):
-    if not is_admin(message.from_user.id):
-        return
-    accounts = settings.get('pay2_accounts', [])
-    if not accounts:
-        bot.reply_to(message, "ℹ️ Koi account configured nahi hai. <code>/pay2_add</code> se add karein.", parse_mode="HTML")
-        return
-    lines = [f"{i}. <code>{a.get('phone','')}</code> — 🔑 <code>{_mask_secret(a.get('password',''))}</code>"
-             for i, a in enumerate(accounts, 1)]
-    bot.reply_to(message, "<b>📋 AUTO-PAY ACCOUNTS</b>\n\n" + "\n".join(lines) + "\n\n<i>Passwords masked hain.</i>", parse_mode="HTML")
-
-
-@bot.message_handler(commands=['pay2_clear'])
-def handle_pay2_clear(message):
-    if not is_admin(message.from_user.id):
-        return
-    settings['pay2_accounts'] = []
-    settings['payment_gateway'] = 'manual'
-    save_settings()
-    sync_pay2_accounts()
-    bot.reply_to(message, "✅ Saare Auto-Pay accounts clear kar diye aur mode OFF kar diya.")
-
-
-@bot.message_handler(commands=['pay2_balance'])
-def handle_pay2_balance(message):
-    if not is_admin(message.from_user.id):
-        return
-    m = bot.send_message(message.chat.id, "⏳ <b>Balance check ho raha hai...</b>", parse_mode="HTML")
-    threading.Thread(target=pay2_show_balance, args=(message.chat.id, m.message_id), daemon=True).start()
-
-
-@bot.message_handler(commands=['pay2_proxy'])
-def handle_pay2_proxy(message):
-    if not is_admin(message.from_user.id):
-        return
-    bot.send_message(
-        message.chat.id,
-        pay2_proxy_menu_text(),
-        reply_markup=pay2_proxy_keyboard(),
-        parse_mode="HTML"
-    )
 
 # ========== CHANNEL MANAGEMENT FLOWS ==========
 @bot.callback_query_handler(func=lambda call: call.data.startswith('chan_') or call.data.startswith('cedit_'))
@@ -3047,7 +2582,7 @@ def handle_set(message):
     
     args = message.text.split(maxsplit=2)
     if len(args) < 3:
-        bot.reply_to(message, "Usage: /set [key] [value]\nExample: /set monthly_amount 129")
+        bot.reply_to(message, "Usage: /set [key] [value]\nExample: /set support @my_support")
         return
     
     key = args[1].lower()
@@ -3059,13 +2594,7 @@ def handle_set(message):
         "support": "support_username",
         "log_channel": "log_channel",
         "upi_id": "upi_id",
-        "upi_name": "upi_name",
-        "monthly_name": "monthly_name",
-        "monthly_amount": "monthly_amount",
-        "monthly_channel": "monthly_channel_id",
-        "lifetime_name": "lifetime_name",
-        "lifetime_amount": "lifetime_amount",
-        "lifetime_channel": "lifetime_channel_id"
+        "upi_name": "upi_name"
     }
     
     if key not in key_map:
@@ -3077,128 +2606,227 @@ def handle_set(message):
     
     bot.reply_to(message, f"✅ Updated {key} to: {value}")
 
-@bot.message_handler(commands=['ban'])
-def handle_ban(message):
-    bot.reply_to(message, "❌ Ban system has been removed from this bot.")
-
-@bot.message_handler(commands=['unban'])
-def handle_unban(message):
-    bot.reply_to(message, "❌ Ban system has been removed from this bot.")
-
-@bot.message_handler(commands=['banlist'])
-def handle_banlist(message):
-    bot.reply_to(message, "❌ Ban system has been removed from this bot.")
+# Ban system fully removed — spam protection (block_level) still active for spam.
 
 # ========== /BROADCAST COMMAND ==========
 @bot.message_handler(commands=['broadcast'])
 def handle_broadcast(message):
-    """Broadcast message to all users"""
+    """Broadcast message to all users (with optional inline button).
+    Entry point for both /broadcast (reply) and admin-panel 'Send message' step."""
     if not is_admin(message.from_user.id):
         return
-    
-    if not message.reply_to_message:
+
+    # Determine the message to broadcast:
+    #  - /broadcast with reply → use replied message
+    #  - admin panel next-step → use this message itself
+    broadcast_msg = message.reply_to_message or message
+
+    # If user sent /broadcast without a reply and this isn't a next-step payload,
+    # show help. (next-step messages always carry the content directly.)
+    if not message.reply_to_message and message.text and message.text.strip().lower().startswith('/broadcast'):
         help_text = """
 <b>📢 BROADCAST COMMAND</b>
 
 <code>Reply to any message with /broadcast</code>
 
 <b>Supported:</b> Text, Photos, Videos, Documents, GIFs, Audio, Voice
+<b>Button:</b> Bot will ask if you want to add an inline button (text + URL)
 
 <b>How to use:</b>
 1. Send the message you want to broadcast
 2. Reply to it with <code>/broadcast</code>
+3. Answer the button prompt (Yes/No)
         """
         bot.reply_to(message, help_text, parse_mode="HTML")
         return
-    
-    replied_msg = message.reply_to_message
-    progress_msg = bot.reply_to(message, "📤 <b>Broadcast Starting...</b>", parse_mode="HTML")
-    
+
+    # Ask whether to add a button
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("✅ Yes, add button", callback_data="bc_btn_yes"),
+        types.InlineKeyboardButton("❌ No, just send", callback_data="bc_btn_no")
+    )
+    bot.reply_to(
+        message,
+        "🔘 <b>Add an inline button to this broadcast?</b>\n\n"
+        "Choose an option below (or reply with the button text directly to add one):",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+    # Store the broadcast message temporarily keyed by chat id for the callback
+    _pending_broadcast[message.chat.id] = broadcast_msg
+
+
+# Temporary store for broadcast message awaiting button choice
+_pending_broadcast = {}
+
+
+@bot.callback_query_handler(func=lambda call: call.data in ("bc_btn_yes", "bc_btn_no"))
+def _broadcast_button_choice(call):
+    chat_id = call.message.chat.id
+    broadcast_msg = _pending_broadcast.pop(chat_id, None)
+    if broadcast_msg is None:
+        bot.answer_callback_query(call.id, "⚠️ Broadcast session expired. Start again.", show_alert=True)
+        return
+
+    if call.data == "bc_btn_no":
+        bot.answer_callback_query(call.id, "✅ Starting broadcast without button...")
+        try:
+            bot.edit_message_text("📤 <b>Broadcast starting (no button)...</b>", chat_id=chat_id,
+                                  message_id=call.message.message_id, parse_mode="HTML")
+        except Exception:
+            pass
+        _run_broadcast(broadcast_msg, button_markup=None, admin_chat=chat_id)
+        return
+
+    # Yes → ask for button text
+    bot.answer_callback_query(call.id, "Enter button text...")
+    msg = bot.edit_message_text(
+        "🔘 <b>Enter the button text</b> (e.g. <i>Buy Now</i>):",
+        chat_id=chat_id, message_id=call.message.message_id, parse_mode="HTML"
+    )
+    bot.register_next_step_handler(msg, _broadcast_ask_button_text, broadcast_msg)
+
+
+def _broadcast_ask_button_text(message, broadcast_msg):
+    if not is_admin(message.from_user.id):
+        return
+    btn_text = (message.text or "").strip()
+    if not btn_text:
+        bot.reply_to(message, "❌ Button text cannot be empty. Broadcast cancelled.")
+        _pending_broadcast.pop(message.chat.id, None)
+        return
+    msg = bot.reply_to(message, f"✅ Button text: <b>{_html_escape(btn_text)}</b>\n\n🔗 <b>Now enter the button URL</b> (e.g. https://t.me/...):", parse_mode="HTML")
+    bot.register_next_step_handler(msg, _broadcast_ask_button_url, broadcast_msg, btn_text)
+
+
+def _broadcast_ask_button_url(message, broadcast_msg, btn_text):
+    if not is_admin(message.from_user.id):
+        return
+    btn_url = (message.text or "").strip()
+    if not btn_url.startswith(("http://", "https://", "tg://")):
+        bot.reply_to(message, "❌ Invalid URL. Must start with http://, https:// or tg://\nBroadcast cancelled.")
+        return
+
+    button = types.InlineKeyboardButton(btn_text, url=btn_url)
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(button)
+
+    bot.reply_to(
+        message,
+        f"✅ Button ready!\n• <b>Text:</b> {_html_escape(btn_text)}\n• <b>URL:</b> <code>{_html_escape(btn_url)}</code>\n\n📤 <b>Broadcast starting...</b>",
+        parse_mode="HTML"
+    )
+    _run_broadcast(broadcast_msg, button_markup=markup, admin_chat=message.chat.id)
+
+
+def _run_broadcast(broadcast_msg, button_markup, admin_chat):
+    """Actually send the broadcast to all users in a background thread."""
+    progress_msg = bot.send_message(admin_chat, "📤 <b>Broadcast Starting...</b>", parse_mode="HTML")
+
     total_users = len(users_data)
     if total_users == 0:
-        bot.edit_message_text("❌ No users to broadcast", chat_id=message.chat.id, message_id=progress_msg.message_id)
+        bot.edit_message_text("❌ No users to broadcast", chat_id=admin_chat, message_id=progress_msg.message_id)
         return
-    
+
     def broadcast_thread():
         sent = 0
         failed = 0
         skipped = 0
         user_ids = list(users_data.keys())
-        
+
         for idx, user_id_str in enumerate(user_ids):
             try:
                 user_id = int(user_id_str)
-                
+
                 # Skip if blocked
                 if user_id_str in spam_data:
                     if spam_data[user_id_str].get("blocked_until", 0) > time.time():
                         skipped += 1
                         continue
-                
+
                 # Send based on type
-                if replied_msg.photo:
+                if broadcast_msg.photo:
                     bot.send_photo(
                         user_id,
-                        photo=replied_msg.photo[-1].file_id,
-                        caption=replied_msg.caption or "",
-                        parse_mode="HTML"
+                        photo=broadcast_msg.photo[-1].file_id,
+                        caption=broadcast_msg.caption or "",
+                        parse_mode="HTML",
+                        reply_markup=button_markup,
+                        protect_content=True
                     )
-                elif replied_msg.video:
+                elif broadcast_msg.video:
                     bot.send_video(
                         user_id,
-                        video=replied_msg.video.file_id,
-                        caption=replied_msg.caption or "",
-                        parse_mode="HTML"
+                        video=broadcast_msg.video.file_id,
+                        caption=broadcast_msg.caption or "",
+                        parse_mode="HTML",
+                        reply_markup=button_markup,
+                        protect_content=True
                     )
-                elif replied_msg.document:
+                elif broadcast_msg.document:
                     bot.send_document(
                         user_id,
-                        document=replied_msg.document.file_id,
-                        caption=replied_msg.caption or "",
-                        parse_mode="HTML"
+                        document=broadcast_msg.document.file_id,
+                        caption=broadcast_msg.caption or "",
+                        parse_mode="HTML",
+                        reply_markup=button_markup,
+                        protect_content=True
                     )
-                elif replied_msg.animation:
+                elif broadcast_msg.animation:
                     bot.send_animation(
                         user_id,
-                        animation=replied_msg.animation.file_id,
-                        caption=replied_msg.caption or "",
-                        parse_mode="HTML"
+                        animation=broadcast_msg.animation.file_id,
+                        caption=broadcast_msg.caption or "",
+                        parse_mode="HTML",
+                        reply_markup=button_markup,
+                        protect_content=True
                     )
-                elif replied_msg.audio:
+                elif broadcast_msg.audio:
                     bot.send_audio(
                         user_id,
-                        audio=replied_msg.audio.file_id,
-                        caption=replied_msg.caption or "",
-                        parse_mode="HTML"
+                        audio=broadcast_msg.audio.file_id,
+                        caption=broadcast_msg.caption or "",
+                        parse_mode="HTML",
+                        reply_markup=button_markup,
+                        protect_content=True
                     )
-                elif replied_msg.voice:
+                elif broadcast_msg.voice:
                     bot.send_voice(
                         user_id,
-                        voice=replied_msg.voice.file_id,
-                        caption=replied_msg.caption or "",
-                        parse_mode="HTML"
+                        voice=broadcast_msg.voice.file_id,
+                        caption=broadcast_msg.caption or "",
+                        parse_mode="HTML",
+                        reply_markup=button_markup,
+                        protect_content=True
                     )
-                elif replied_msg.text:
-                    bot.send_message(user_id, replied_msg.text, parse_mode="HTML")
-                elif replied_msg.caption:
-                    bot.send_message(user_id, replied_msg.caption, parse_mode="HTML")
-                
+                elif broadcast_msg.text:
+                    bot.send_message(
+                        user_id, broadcast_msg.text, parse_mode="HTML",
+                        reply_markup=button_markup, protect_content=True
+                    )
+                elif broadcast_msg.caption:
+                    bot.send_message(
+                        user_id, broadcast_msg.caption, parse_mode="HTML",
+                        reply_markup=button_markup, protect_content=True
+                    )
+
                 sent += 1
-                
+
                 # Update progress every 50 users
                 if (idx + 1) % 50 == 0:
                     percent = int((idx + 1) / total_users * 100)
                     try:
                         bot.edit_message_text(
-                            f"📤 Broadcasting... {percent}% ({sent} sent, {failed} failed)", 
-                            chat_id=message.chat.id, 
+                            f"📤 Broadcasting... {percent}% ({sent} sent, {failed} failed)",
+                            chat_id=admin_chat,
                             message_id=progress_msg.message_id
                         )
                     except:
                         pass
-                
+
                 time.sleep(0.05)  # Rate limit protection
-                
+
             except Exception as e:
                 failed += 1
                 # Auto-remove dead users
@@ -3206,10 +2834,10 @@ def handle_broadcast(message):
                 if "forbidden" in error_str or "blocked" in error_str or "deactivated" in error_str:
                     if user_id_str in users_data:
                         del users_data[user_id_str]
-        
+
         # Save all data after broadcast complete
         save_all_data()
-        
+
         final_text = f"""
 ✅ <b>BROADCAST COMPLETE!</b>
 
@@ -3219,21 +2847,19 @@ def handle_broadcast(message):
 • ⏭️ Skipped: {skipped}
 • 👥 Total: {total_users}
         """
-        
+
         try:
             bot.edit_message_text(
-                final_text, 
-                chat_id=message.chat.id, 
-                message_id=progress_msg.message_id, 
+                final_text,
+                chat_id=admin_chat,
+                message_id=progress_msg.message_id,
                 parse_mode="HTML"
             )
         except:
             pass
-    
+
     thread = threading.Thread(target=broadcast_thread)
     thread.start()
-    
-    bot.reply_to(message, f"📢 Broadcast started to {total_users} users!")
 
 # ========== /STATS COMMAND ==========
 @bot.message_handler(commands=['stats'])
@@ -3448,90 +3074,8 @@ def handle_clone_config(message):
         parse_mode="HTML",
     )
 
-# Legacy channel commands removed
-
-@bot.message_handler(commands=['demo_toggle'])
-def handle_demo_toggle(message):
-    if not is_admin(message.from_user.id):
-        return
-
-    current_status = settings.get('demo_paid_status', False)
-    new_status = not current_status
-    settings['demo_paid_status'] = new_status
-    save_settings()
-
-    status_text = "PAID" if new_status else "FREE"
-    bot.reply_to(message, f"✅ Demo is now <b>{status_text}</b>.", parse_mode="HTML")
-
-@bot.message_handler(commands=['demo_price'])
-def handle_demo_price(message):
-    if not is_admin(message.from_user.id):
-        return
-
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "Usage: <code>/demo_price amount</code>", parse_mode="HTML")
-        return
-
-    amount = args[1]
-    settings['demo_amount'] = amount
-    save_settings()
-    bot.reply_to(message, f"✅ Demo price set to <b>₹{amount}</b>.", parse_mode="HTML")
-
-@bot.message_handler(commands=['set_demo_color'])
-def handle_set_demo_color(message):
-    if not is_admin(message.from_user.id):
-        return
-
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(
-            message,
-            """Usage: <code>/set_demo_color color</code>
-Available colors: <code>blue / green / red / default</code>
-Examples:
-<code>/set_demo_color green</code>
-<code>/set_demo_color default</code>""",
-            parse_mode="HTML"
-        )
-        return
-
-    color_raw = args[1]
-    resolved = resolve_color(color_raw)
-    save_value = color_raw if resolved is not None else ""
-    settings['demo_color'] = save_value
-    save_settings()
-    bot.reply_to(message, f"✅ Demo button color set to: {color_name_display(save_value)}", parse_mode="HTML")
-
-@bot.message_handler(commands=['set_demo_ch'])
-def handle_set_demo_ch(message):
-    if not is_admin(message.from_user.id):
-        return
-
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "Usage: <code>/set_demo_ch channel_id</code>", parse_mode="HTML")
-        return
-
-    ch_id = args[1]
-    settings['demo_channel_id'] = ch_id
-    save_settings()
-    bot.reply_to(message, f"✅ Demo Channel ID set to: <code>{ch_id}</code>", parse_mode="HTML")
-
-@bot.message_handler(commands=['set_demo_link'])
-def handle_set_demo_link(message):
-    if not is_admin(message.from_user.id):
-        return
-
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "Usage: <code>/set_demo_link https://t.me/xxx</code>", parse_mode="HTML")
-        return
-
-    url = args[1]
-    settings['demo_channel_link'] = url
-    save_settings()
-    bot.reply_to(message, f"✅ Demo Channel Link set to: {url}")
+# Demo text commands removed — use Admin Panel → Demo Settings buttons
+# (Toggle FREE/PAID, Set Price, Set Link, Set ID are all button-based now)
 
 # Support and Force Join toggles removed
 
@@ -4112,155 +3656,8 @@ def handle_remove_premium_ch(message):
     else:
         bot.reply_to(message, f"❌ Channel ID {ch_id} not found.")
 
-@bot.message_handler(commands=['list_ch'])
-def handle_list_ch(message):
-    if not is_admin(message.from_user.id):
-        return
-
-    channels = settings.get('premium_channels', [])
-    if not channels:
-        bot.reply_to(message, "❌ No premium channels added yet. Use /add_premium_ch first.")
-        return
-
-    lines = ["<b>📋 PREMIUM CHANNELS (Current Order)</b>\n"]
-    lines.append("<code>Pos  ID       Name                       Price  Color</code>")
-    lines.append("<code>──── ──────── ────────────────────────── ───── ─────────────</code>")
-    for idx, ch in enumerate(channels, 1):
-        ch_id = str(ch.get('id', '??'))[:8].ljust(8)
-        name = (ch.get('name', 'Unknown') or 'Unknown')[:26].ljust(26)
-        price = "₹" + str(ch.get('amount', '0'))
-        color = color_name_display(ch.get('color', ''))
-        lines.append(f"<code>{idx:>3}.  {ch_id} {name} {price:>5}</code>  {color}")
-
-    lines.append(f"\n<b>Total:</b> {len(channels)} channels")
-    lines.append("\n<i>Order change karne ke liye use karein:</i>")
-    lines.append("  <code>/reorder_ch ch_id NEW_POSITION</code>")
-    lines.append("  <code>/swap_ch ch_id1 ch_id2</code>")
-    bot.reply_to(message, "\n".join(lines), parse_mode="HTML")
-
-@bot.message_handler(commands=['reorder_ch'])
-def handle_reorder_ch(message):
-    if not is_admin(message.from_user.id):
-        return
-
-    args = message.text.split()
-    if len(args) < 3:
-        bot.reply_to(
-            message,
-            """Usage: <code>/reorder_ch channel_id NEW_POSITION</code>
-
-<b>Example:</b>
-  <code>/list_ch</code>                          → Pehle current order dekh lo
-  <code>/reorder_ch ch1 5</code>                → ch1 ko 5th position par le jaao
-  <code>/reorder_ch ch5 2</code>                → ch5 ko 2nd position par le jaao
-
-<b>Note:</b> Positions <code>1</code> se start hoti hai. Last position = total channels.""",
-            parse_mode="HTML"
-        )
-        return
-
-    ch_id = args[1]
-    try:
-        new_pos = int(args[2])
-    except ValueError:
-        bot.reply_to(message, "❌ Position must be a number (1, 2, 3, ...).")
-        return
-
-    channels = settings.get('premium_channels', [])
-    total = len(channels)
-
-    if new_pos < 1 or new_pos > total:
-        bot.reply_to(message, f"❌ Invalid position! Total channels = {total}. Use 1 to {total}.")
-        return
-
-    old_idx = None
-    moving_ch = None
-    for i, ch in enumerate(channels):
-        if ch.get('id') == ch_id:
-            old_idx = i
-            moving_ch = ch
-            break
-
-    if old_idx is None or moving_ch is None:
-        bot.reply_to(message, f"❌ Channel ID '{ch_id}' not found. Use /list_ch to see IDs.")
-        return
-
-    old_pos = old_idx + 1
-    if old_pos == new_pos:
-        bot.reply_to(message, f"ℹ️ Channel {ch_id} already at position {new_pos}. No change.")
-        return
-
-    channels.pop(old_idx)
-    channels.insert(new_pos - 1, moving_ch)
-    settings['premium_channels'] = channels
-    save_settings()
-
-    bot.reply_to(
-        message,
-        f"✅ <b>Order Updated!</b>\n\n"
-        f"📦 <b>{moving_ch.get('name', ch_id)}</b> (<code>{ch_id}</code>)\n"
-        f"   Old Position: #{old_pos}\n"
-        f"   New Position: #{new_pos}\n\n"
-        f"Verify with: <code>/list_ch</code>",
-        parse_mode="HTML"
-    )
-
-@bot.message_handler(commands=['swap_ch'])
-def handle_swap_ch(message):
-    if not is_admin(message.from_user.id):
-        return
-
-    args = message.text.split()
-    if len(args) < 3:
-        bot.reply_to(
-            message,
-            """Usage: <code>/swap_ch channel_id1 channel_id2</code>
-
-Do channels ki position aapas mein swap/swap kar dega.
-
-<b>Example:</b>
-  <code>/list_ch</code>             → Pehle current order dekh lo
-  <code>/swap_ch ch1 ch5</code>     → ch1 aur ch5 ki positions swap ho jaayengi""",
-            parse_mode="HTML"
-        )
-        return
-
-    ch_id1 = args[1]
-    ch_id2 = args[2]
-
-    if ch_id1 == ch_id2:
-        bot.reply_to(message, "❌ Both channel IDs are same. Nothing to swap.")
-        return
-
-    channels = settings.get('premium_channels', [])
-    idx1 = None
-    idx2 = None
-    for i, ch in enumerate(channels):
-        if ch.get('id') == ch_id1:
-            idx1 = i
-        if ch.get('id') == ch_id2:
-            idx2 = i
-
-    if idx1 is None:
-        bot.reply_to(message, f"❌ Channel ID '{ch_id1}' not found.")
-        return
-    if idx2 is None:
-        bot.reply_to(message, f"❌ Channel ID '{ch_id2}' not found.")
-        return
-
-    ch1 = channels[idx1]
-    ch2 = channels[idx2]
-    channels[idx1], channels[idx2] = channels[idx2], channels[idx1]
-    settings['premium_channels'] = channels
-    save_settings()
-
-    bot.reply_to(
-        message,
-        f"✅ <b>Channels Swapped!</b>\n\n"
-        f"🔀 <b>{ch1.get('name', ch_id1)}</b> (<code>{ch_id1}</code>) ↔️  <b>{ch2.get('name', ch_id2)}</b> (<code>{ch_id2}</code>)\n\n"
-        f"Verify with: <code>/list_ch</code>",
-        parse_mode="HTML"
-    )
+# Channel reorder commands (/list_ch, /reorder_ch, /swap_ch) removed —
+# channel order follows premium_channels list order in settings.
 
 @bot.message_handler(commands=['edit_premium_ch'])
 def handle_edit_premium_ch(message):
@@ -5167,7 +4564,7 @@ def handle_help(message):
 
 ━━━━━━━━━━━━━━━
 <b>🔹 HOW TO BUY PREMIUM:</b>
-1. Send <code>/start</code> → Click any <b>💎 Premium Channel</b> button
+1. Send <code>/start</code> → Click any <b>Premium Channel</b> button
 2. Click <b>💳 Buy Now</b> → Scan QR / Pay via UPI
    ⚠️ <b>NOTE:</b> ❌ DO NOT USE GPAY. Use PhonePe / Paytm / BHIM
 3. Click <b>✅ Payment Done</b> → Send <b>payment screenshot</b> as PHOTO
@@ -5221,21 +4618,7 @@ Use: <code>/set [key] [value]</code>
   log_channel   - Admin log channel ID
   upi_id        - Your UPI ID
   upi_name      - Your name (shown in QR)
-  monthly_name  - Legacy plan name
-  monthly_amount - Legacy price
-  monthly_channel - Legacy channel ID
-  lifetime_name  - Legacy plan name
-  lifetime_amount - Legacy price
-  lifetime_channel - Legacy channel ID
 <b>Example:</b> <code>/set support @custom_support</code>
-
-━━━━━━━━━━━━━━━
-<b>🔹 DEMO CHANNEL SETTINGS:</b>
-/demo_toggle        - Toggle demo between FREE/PAID
-/demo_price [amt]   - Set demo price (e.g. /demo_price 10)
-/set_demo_color [color] - 🎨 Demo button color: blue / green / red / default
-/set_demo_ch [id]   - Set demo channel ID (for invite link)
-/set_demo_link [url] - Set demo channel link (direct URL)
 
 ━━━━━━━━━━━━━━━
 <b>🔹 PAYMENT PROOF SETTINGS:</b>
@@ -5257,22 +4640,6 @@ Use: <code>/set [key] [value]</code>
     → <b>OFF:</b> pehle jaise <b>direct one-time link</b> (member_limit=1)
 
 ━━━━━━━━━━━━━━━
-<b>🔹 AUTO-PAY (pay2) GATEWAY:</b>
-/pay2        - 💳 Auto-Pay panel (ON/OFF + accounts), button based
-/pay2_toggle - 🔁 Manual UPI/QR ⇄ Gateway payment link
-    → <b>ON:</b> user ko gateway ka <b>payment link</b> button milega
-    → <b>OFF:</b> purana manual UPI/QR + screenshot flow
-/pay2_add    - ➕ Account add (step-by-step: phone → password)
-/pay2_list   - 📋 Accounts list (passwords masked)
-/pay2_balance- 💰 Har account ka latest balance (fresh gateway login)
-/pay2_proxy  - 🌐 Proxy set/change/reset/disable (bot panel se, restart ke bina)
-/pay2_clear  - 🗑 Saare accounts clear + mode OFF
-    → <b>Phone format:</b> <code>+91-9XXXXXXXXX</code> (country code zaruri)
-    → Accounts round-robin rotate hote hain, fail par auto-switch
-    → Saare calls India residential proxy se jaate hain (panel se set karo ya PAY2_PROXY env var)
-    → Payment Done par: gateway se <b>auto-verify</b>; na ho to UTR (refNo) se verify
-
-━━━━━━━━━━━━━━━
 <b>🔹 PREMIUM CHANNEL MANAGEMENT:</b>
 /add_premium_ch [id] [Full Name] [price] [channel_id] [color]
     → Add new premium channel (optional color at END)
@@ -5286,18 +4653,6 @@ Use: <code>/set [key] [value]</code>
     → <b>Keys:</b> name, amount, channel_id, duration, description, <b>color</b>
     → <b>Example:</b> <code>/edit_premium_ch ch1 color green</code>
     → <b>Example:</b> <code>/edit_premium_ch ch1 amount 149</code>
-
-/list_ch  - 📋 Show ALL channels in current order (with position numbers + color)
-
-/reorder_ch [id] [NEW_POSITION]  - 🔄 Move a channel to exact position
-    → Positions start at 1. Last position = total channels
-    → <b>Example (your case):</b>
-      <code>/list_ch</code>                     → Pehle current order dekh lo
-      <code>/reorder_ch ch1 5</code>           → 1st wale ko 5th position par
-      <code>/reorder_ch ch5 2</code>           → 5th wale ko 2nd position par
-
-/swap_ch [id1] [id2]  - 🔀 Swap positions of 2 channels
-    → <b>Example:</b> <code>/swap_ch ch1 ch5</code>  → ch1 ↔ ch5 (direct swap)
 
 🎨 <b>BUTTON COLOR SYSTEM:</b>
 Telegram officially supports 3 colors + default:
@@ -5342,6 +4697,7 @@ All other buttons (Buy Now, Back, Payment Done, etc.) automatically get random c
     → Send message to ALL bot users
     → <b>Supports:</b> Text, Photo, Video, Document, GIF, Audio, Voice
     → <b>How:</b> Send message first → Reply to it with <code>/broadcast</code>
+    → <b>Button:</b> Bot will ask if you want to add a button (text + URL) to the broadcast
 
 ━━━━━━━━━━━━━━━
 <b>🔹 STATISTICS & REPORTS:</b>
@@ -5366,12 +4722,6 @@ All other buttons (Buy Now, Back, Payment Done, etc.) automatically get random c
 /imp_to_mongo (reply to JSON)  - Import specific JSON file to MongoDB
 
 ━━━━━━━━━━━━━━━
-<b>🔹 OTHER / LEGACY:</b>
-/ban       → ❌ Ban system removed
-/unban     → ❌ Ban system removed
-/banlist   → ❌ Ban system removed
-
-━━━━━━━━━━━━━━━
 <b>💡 QUICK START (NEW SETUP):</b>
 1. <code>/set support @your_username</code>
 2. <code>/set upi_id your@upi</code>
@@ -5381,6 +4731,64 @@ All other buttons (Buy Now, Back, Payment Done, etc.) automatically get random c
     """
 
     _send_long_html(message.chat.id, admin_help, reply_to_message=message)
+
+# ========== ADMIN COMMAND REGISTRY (text commands reusable from admin buttons) ==========
+# Maps a bare command name (no slash) to its existing handler function so the admin
+# panel can trigger ANY command from a button tap — no typing needed. Text commands
+# keep working exactly as before (backward compatible).
+_ADMIN_CMD_HANDLERS = {
+    # channels / prices
+    "add_premium_ch": handle_add_premium_ch,
+    "remove_premium_ch": handle_remove_premium_ch,
+    "edit_premium_ch": handle_edit_premium_ch,
+    "set_price": handle_set_price,
+    "set_ch": handle_set_ch,
+    # admins / config
+    "add_admin": handle_add_admin,
+    "remove_admin": handle_remove_admin,
+    "clone_config": handle_clone_config,
+    # modes / toggles
+    "proof_toggle": handle_proof_toggle,
+    "support_toggle": handle_support_toggle,
+    "join_request_toggle": handle_join_request_toggle,
+    # proof / media
+    "set_proof_link": handle_set_proof_link,
+    "set_proof_channel": handle_set_proof_channel,
+    "set_backup_ch": handle_set_backup_ch,
+    "media_cache_now": handle_media_cache_now,
+    "media_check": handle_media_check,
+    # demos
+    "set_start_demos": handle_set_start_demos,
+    "clear_start_demos": handle_clear_start_demos,
+    "set_plan_demos": handle_set_plan_demos,
+    "clear_plan_demos": handle_clear_plan_demos,
+    "set_demo_desc": handle_set_demo_desc,
+    "clear_demo_desc": handle_clear_demo_desc,
+    "remove_all_demo": handle_remove_all_demo,
+    # start message
+    "setstartmsg": handle_set_start_message,
+    "getstartmsg": handle_get_start_message,
+    "clearstartmsg": handle_clear_start_message,
+    # data / backup
+    "backup": handle_backup,
+    "savedata": handle_save_data,
+    "cleanbackups": handle_clean_backups,
+    "exportdata": handle_export_data,
+    "impdata": handle_impdata,
+    "imp_to_mongo": handle_imp_to_mongo,
+    "migrate_to_mongo": handle_migrate_to_mongo,
+    # reports / reset
+    "stats": handle_stats,
+    "sales": handle_sales,
+    "pending": handle_pending,
+    "clear_all_payments": handle_clear_all_payments,
+    "clear_pending_pay": handle_clear_pending_pay,
+    "clear_verified": handle_clear_verified,
+    "clear_orders": handle_clear_orders,
+    # misc
+    "settings": handle_settings,
+    "help": handle_help,
+}
 
 # ========== SILENT HANDLER ==========
 @bot.message_handler(func=lambda message: True)
