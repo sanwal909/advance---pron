@@ -65,6 +65,29 @@ def make_channel_button(text, channel_color, **kwargs):
     kwargs['style'] = get_random_button_color_nondefault()
     return types.InlineKeyboardButton(text, **kwargs)
 
+def add_buttons_layout(keyboard, buttons):
+    """Add buttons to a keyboard honouring the admin 'Multi-Button Layout' toggle.
+      OFF -> one button per row (default)
+      ON  -> alternating rows of 1, 2, 1, 2 ... (as configured by admin)
+    """
+    try:
+        multi = bool(settings.get('multi_button_mode', False))
+    except Exception:
+        multi = False
+    if not multi:
+        for b in buttons:
+            keyboard.add(b)
+        return
+    pattern = (1, 2)
+    idx = 0
+    row_i = 0
+    total = len(buttons)
+    while idx < total:
+        size = pattern[row_i % len(pattern)]
+        keyboard.add(*buttons[idx:idx + size])
+        idx += size
+        row_i += 1
+
 class VerificationSystem:
     def __init__(self, bot):
         self.bot = bot
@@ -179,17 +202,19 @@ class VerificationSystem:
             return f"Error creating link: {str(e)}"
 
     def plan_selection_keyboard(self):
-        """Dynamic Membership keyboard with channel-specific or random button colors"""
+        """Dynamic Membership keyboard — button shows only the channel name."""
         keyboard = types.InlineKeyboardMarkup(row_width=1)
 
         channels = settings.get("premium_channels", [])
-        for ch in channels:
-            btn = make_channel_button(
-                f"🔗 {ch['name']} - ₹{ch['amount']}",
+        buttons = [
+            make_channel_button(
+                ch['name'],
                 ch.get('color', ''),
                 callback_data=f"plan_{ch['id']}"
             )
-            keyboard.add(btn)
+            for ch in channels
+        ]
+        add_buttons_layout(keyboard, buttons)
 
         back_btn = make_colored_button("⬅️ Back to Menu", callback_data="main_menu")
         keyboard.add(back_btn)
@@ -216,14 +241,16 @@ class VerificationSystem:
             btn = make_colored_button("📢 Free Video Channel (Not Set)", callback_data="demo_not_set")
             keyboard.add(btn)
 
-        # 2. Premium Channels (Directly shown)
+        # 2. Premium Channels (Directly shown — button shows only channel name)
         channels = settings.get("premium_channels", [])
-        for ch in channels:
-            btn = make_colored_button(
-                f"💎 {ch['name']} - ₹{ch['amount']}",
+        buttons = [
+            make_colored_button(
+                ch['name'],
                 callback_data=f"plan_{ch['id']}"
             )
-            keyboard.add(btn)
+            for ch in channels
+        ]
+        add_buttons_layout(keyboard, buttons)
 
         # 3. Payment Proof Channel
         if settings.get("payment_proof_status", True):
@@ -617,16 +644,18 @@ You'll receive unique join link within few minutes.
             f"👇 <b>Buy Now to get your access:</b>"
         )
 
-        # Buy Now buttons for ALL premium channels (admin-set)
+        # Buy Now buttons for ALL premium channels (admin-set) — name only
         keyboard = types.InlineKeyboardMarkup(row_width=1)
         channels = settings.get("premium_channels", [])
-        for ch in channels:
-            btn = make_channel_button(
-                f"Buy {ch.get('name', 'Channel')} — ₹{ch.get('amount', '')}",
+        buttons = [
+            make_channel_button(
+                ch.get('name', 'Channel'),
                 ch.get('color', ''),
                 callback_data=f"plan_{ch.get('id')}"
             )
-            keyboard.add(btn)
+            for ch in channels
+        ]
+        add_buttons_layout(keyboard, buttons)
 
         AUTO_DELAY = 12 * 3600  # 12 hours
 
