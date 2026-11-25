@@ -84,7 +84,11 @@ def add_buttons_layout(keyboard, buttons):
     total = len(buttons)
     while idx < total:
         size = pattern[row_i % len(pattern)]
-        keyboard.add(*buttons[idx:idx + size])
+        row = list(buttons[idx:idx + size])
+        # NOTE: keyboard.add() re-chunks by the markup's row_width (here 1), which would
+        # split a 2-button row back into single-button rows. Append the row directly so the
+        # 1-2-1 pattern actually shows up.
+        keyboard.keyboard.append(row)
         idx += size
         row_i += 1
 
