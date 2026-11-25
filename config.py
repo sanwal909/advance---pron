@@ -530,13 +530,6 @@ DEFAULT_SETTINGS = {
     "demo_channel_link": DEMO_CHANNEL_LINK,
     "upi_id": UPI_ID,
     "upi_name": UPI_NAME,
-    # Payment mode: "manual" = UPI/QR + screenshot, "pay2" = In666 auto-pay link
-    "payment_gateway": "manual",
-    # Auto-pay (pay2.py) accounts: [{"phone": "+91-XXXXXXXXXX", "password": "..."}]
-    "pay2_accounts": [],
-    # Auto-pay proxy override (bot panel se). "" = env/default use karo,
-    # "off" = proxy disable, warna pura proxy URL.
-    "pay2_proxy": "",
     "demo_channel_id": "",
     "demo_paid_status": False,
     "demo_amount": "10",
@@ -544,6 +537,7 @@ DEFAULT_SETTINGS = {
     "payment_proof_link": "",
     "payment_proof_status": True,
     "join_request_mode": False,
+    "multi_button_mode": False,
     "support_username": "",
     "support_status": True,
     "how_to_buy_url": "",
@@ -734,14 +728,13 @@ def _run_idempotent_migrations(settings_obj):
                          ('payment_proof_link', ""), ('force_join_status', True),
                          ('auto_accept_requests', False), ('backup_channel', ""),
                          ('join_request_mode', False),
+                         ('multi_button_mode', False),
                          ('log_channel', ""), ('demo_channel_link', ""),
                          ('demo_channel_id', ""), ('demo_paid_status', False),
                          ('demo_amount', "10"), ('demo_color', ""),
                          ('support_username', ""), ('support_status', True),
                          ('how_to_buy_url', ""), ('total_orders', 0),
                          ('upi_id', ""), ('upi_name', ""),
-                         ('payment_gateway', 'manual'), ('pay2_accounts', []),
-                         ('pay2_proxy', ''),
                          ('start_demo_videos', []), ('plan_demo_videos', {}),
                          ('start_demo_desc', ""), ('plan_demo_descs', {})):
         if key not in settings_obj:
@@ -1037,9 +1030,7 @@ def initialize_spam_data():
                 "requests": [],
                 "warnings": 0,
                 "blocked_until": 0,
-                "block_level": 0,
-                "ban_reason": "",
-                "banned_by": 0
+                "block_level": 0
             }
             initialized += 1
     if initialized > 0:
