@@ -148,10 +148,19 @@ _PROTECTED_METHODS = (
     'send_poll', 'send_dice', 'send_invoice',
 )
 
+def _save_restriction_on():
+    """Admin toggle: save/forward restriction ON hai ya OFF. Default = ON."""
+    try:
+        return bool(settings.get('save_restriction', True))
+    except Exception:
+        return True
+
 def _wrap_protect(method):
     def _wrapped(*args, **kwargs):
+        # Admin toggle ke hisaab se decide hota hai (default ON).
+        # Caller explicit protect_content=... de to wahi priority lega.
         if 'protect_content' not in kwargs:
-            kwargs['protect_content'] = True
+            kwargs['protect_content'] = _save_restriction_on()
         return method(*args, **kwargs)
     _wrapped.__name__ = getattr(method, '__name__', 'wrapped')
     return _wrapped
@@ -1438,11 +1447,14 @@ Please use any other UPI app (PhonePe, Paytm, BHIM, etc.) for payment.
 
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     btn1 = make_button("✅ Payment Done", callback_data="payment_done")
+    btn_qr = make_button("📥 Download QR", callback_data="qr_save")
     btn2 = make_button("🔙 Back", callback_data=f"plan_{plan_type}")
-    keyboard.add(btn1, btn2)
+    keyboard.add(btn1, btn_qr, btn2)
 
     if qr_image:
-        sent_msg = bot.send_photo(chat_id, photo=qr_image, caption=caption, reply_markup=keyboard, parse_mode="HTML")
+        # QR ko protect_content=False se bheja jaata hai taaki user ise
+        # save / forward / download kar sake (payment ke liye zaroori).
+        sent_msg = bot.send_photo(chat_id, photo=qr_image, caption=caption, reply_markup=keyboard, parse_mode="HTML", protect_content=False)
         track_msg(chat_id, sent_msg.message_id)
         delete_message_after_delay(chat_id, sent_msg.message_id, 600, send_timeout_msg=True)
     else:
@@ -1451,6 +1463,59 @@ Please use any other UPI app (PhonePe, Paytm, BHIM, etc.) for payment.
         delete_message_after_delay(chat_id, sent_msg.message_id, 600, send_timeout_msg=True)
 
     bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "qr_save")
+def handle_qr_save(call):
+    """QR ko SAVE / FORWARD / DOWNLOAD karne ke liye dobara bhejo (bina restriction)."""
+    chat_id = call.message.chat.id
+    user_id = call.from_user.id
+    try:
+        bot.answer_callback_query(call.id, "📥 QR bhej raha hoon...")
+    except Exception:
+        pass
+
+    # Pending order se amount nikaalo (agar available ho)
+    amount = None
+    try:
+        pend = pending_verifications.get(str(user_id))
+        if pend and pend.get('amount'):
+            amount = pend.get('amount')
+    except Exception:
+        amount = None
+
+    qr_image = None
+    try:
+        qr_image = premium_bot.generate_qr_code(
+            settings['upi_id'], amount if amount else "0", settings['upi_name']
+        )
+    except Exception as _e:
+        logging.error(f"handle_qr_save QR error: {type(_e).__name__}: {_e}")
+        qr_image = None
+
+    note = (
+        "📥 <b>QR FILE — DOWNLOAD</b>\n\n"
+        f"UPI ID: <code>{_html_escape(settings['upi_id'])}</code>\n"
+        f"Name: {_html_escape(settings['upi_name'])}"
+        + (f"\nAmount: <b>₹{_html_escape(str(amount))}</b>" if amount else "")
+        + "\n\nFile par tap karke download / save kar lo."
+    )
+    try:
+        if qr_image:
+            qr_image.seek(0)
+            _fname = f"payment_qr_{amount}.png" if amount else "payment_qr.png"
+            m = bot.send_document(
+                chat_id, document=qr_image,
+                visible_file_name=_fname,
+                caption=note, parse_mode="HTML", protect_content=False
+            )
+            track_msg(chat_id, m.message_id)
+        else:
+            bot.send_message(chat_id, "⚠️ QR generate nahi ho paaya (UPI/amount check karo).",
+                             parse_mode="HTML", protect_content=False)
+    except Exception as _e:
+        logging.error(f"handle_qr_save send error: {type(_e).__name__}: {_e}")
+
 
 @bot.callback_query_handler(func=lambda call: call.data == "back_to_main")
 def handle_back_to_main(call):
@@ -1983,19 +2048,22 @@ def handle_admin_callbacks(call):
             types.InlineKeyboardButton(f"🤖 Auto-Accept: {'ON' if settings.get('auto_accept_requests') else 'OFF'}", callback_data="mode_toggle_auto"),
             types.InlineKeyboardButton(f"🆘 Support Button: {'ON' if settings.get('support_status', True) else 'OFF'}", callback_data="mode_toggle_support"),
             types.InlineKeyboardButton(f"🧩 Multi-Button Layout: {'ON' if settings.get('multi_button_mode') else 'OFF'}", callback_data="mode_toggle_btnlayout"),
+            types.InlineKeyboardButton(f"🔒 Save/Forward Restriction: {'ON' if settings.get('save_restriction', True) else 'OFF'}", callback_data="mode_toggle_saverestrict"),
             types.InlineKeyboardButton("⬅️ Back to Menu", callback_data="admin_main")
         )
         bot.edit_message_text(
             "<b>🔐 BOT MODES</b>\n\nToggle security and automation modes:\n\n"
             "<i>🧩 Multi-Button Layout = ON karne par channel/demo buttons 1-2-1 pattern me "
-            "dikhenge. OFF par ek line me ek button.</i>",
+            "dikhenge. OFF par ek line me ek button.\n\n"
+            "🔒 Save/Forward Restriction = ON par users bot ka content save/forward nahi kar "
+            "sakte (QR image chhod kar). OFF karne par sab content save/forward ho sakega.</i>",
             chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=kb, parse_mode="HTML")
 
     elif data.startswith("mode_toggle_"):
         mode = data.replace("mode_toggle_", "")
-        key = {"join": "join_request_mode", "proof": "payment_proof_status", "force": "force_join_status", "auto": "auto_accept_requests", "support": "support_status", "btnlayout": "multi_button_mode"}.get(mode)
+        key = {"join": "join_request_mode", "proof": "payment_proof_status", "force": "force_join_status", "auto": "auto_accept_requests", "support": "support_status", "btnlayout": "multi_button_mode", "saverestrict": "save_restriction"}.get(mode)
         if key:
-            _mode_defaults = {"support_status": True}
+            _mode_defaults = {"support_status": True, "save_restriction": True}
             settings[key] = not settings.get(key, _mode_defaults.get(key, False))
             save_settings()
             handle_admin_callbacks(types.CallbackQuery(id='0', from_user=call.from_user, chat_instance='0', message=call.message, data='admin_modes', json_string='{}'))
@@ -2753,7 +2821,7 @@ def _run_broadcast(broadcast_msg, button_markup, admin_chat):
                         caption=broadcast_msg.caption or "",
                         parse_mode="HTML",
                         reply_markup=button_markup,
-                        protect_content=True
+                        protect_content=_save_restriction_on()
                     )
                 elif broadcast_msg.video:
                     bot.send_video(
@@ -2762,7 +2830,7 @@ def _run_broadcast(broadcast_msg, button_markup, admin_chat):
                         caption=broadcast_msg.caption or "",
                         parse_mode="HTML",
                         reply_markup=button_markup,
-                        protect_content=True
+                        protect_content=_save_restriction_on()
                     )
                 elif broadcast_msg.document:
                     bot.send_document(
@@ -2771,7 +2839,7 @@ def _run_broadcast(broadcast_msg, button_markup, admin_chat):
                         caption=broadcast_msg.caption or "",
                         parse_mode="HTML",
                         reply_markup=button_markup,
-                        protect_content=True
+                        protect_content=_save_restriction_on()
                     )
                 elif broadcast_msg.animation:
                     bot.send_animation(
@@ -2780,7 +2848,7 @@ def _run_broadcast(broadcast_msg, button_markup, admin_chat):
                         caption=broadcast_msg.caption or "",
                         parse_mode="HTML",
                         reply_markup=button_markup,
-                        protect_content=True
+                        protect_content=_save_restriction_on()
                     )
                 elif broadcast_msg.audio:
                     bot.send_audio(
@@ -2789,7 +2857,7 @@ def _run_broadcast(broadcast_msg, button_markup, admin_chat):
                         caption=broadcast_msg.caption or "",
                         parse_mode="HTML",
                         reply_markup=button_markup,
-                        protect_content=True
+                        protect_content=_save_restriction_on()
                     )
                 elif broadcast_msg.voice:
                     bot.send_voice(
@@ -2798,17 +2866,17 @@ def _run_broadcast(broadcast_msg, button_markup, admin_chat):
                         caption=broadcast_msg.caption or "",
                         parse_mode="HTML",
                         reply_markup=button_markup,
-                        protect_content=True
+                        protect_content=_save_restriction_on()
                     )
                 elif broadcast_msg.text:
                     bot.send_message(
                         user_id, broadcast_msg.text, parse_mode="HTML",
-                        reply_markup=button_markup, protect_content=True
+                        reply_markup=button_markup, protect_content=_save_restriction_on()
                     )
                 elif broadcast_msg.caption:
                     bot.send_message(
                         user_id, broadcast_msg.caption, parse_mode="HTML",
-                        reply_markup=button_markup, protect_content=True
+                        reply_markup=button_markup, protect_content=_save_restriction_on()
                     )
 
                 sent += 1
